@@ -12,10 +12,33 @@ import (
 	"github.com/subtotalstew/gometrics.git/internal/storage"
 )
 
-func TestUpdate(t *testing.T) {
+func TestSetGauge(t *testing.T) {
+	s := &storage.MemStorage{
+		Gauge:   make(map[string]float64),
+		Counter: make(map[string]int64),
+	}
+	s.SetGauge("Test", float64(55))
+	if s.Gauge["Test"] != 55 {
+		t.Errorf("Test gauge failed, got: %f, want: %f", s.Gauge["Test"], float64(55))
+	}
+}
+
+func TestUpdateCounter(t *testing.T) {
+	s := &storage.MemStorage{
+		Gauge:   make(map[string]float64),
+		Counter: make(map[string]int64),
+	}
+	s.UpdateCounter("Test", 1)
+	if s.Counter["Test"] != int64(1) {
+		t.Errorf("Test counter failed, got: %v, want: %v", s.Counter["Test"], int64(1))
+	}
+}
+
+func TestUpdateHandler(t *testing.T) {
 	type requestdata struct {
 		method      string
 		contentType string
+		url         string
 	}
 	type responsedata struct {
 		code        int
@@ -38,6 +61,7 @@ func TestUpdate(t *testing.T) {
 			requestdata: requestdata{
 				method:      http.MethodPost,
 				contentType: "application/json",
+				url:         "/update/counter/TestMetric/1",
 			},
 		},
 		{
@@ -50,12 +74,105 @@ func TestUpdate(t *testing.T) {
 			requestdata: requestdata{
 				method:      http.MethodGet,
 				contentType: "text/plain",
+				url:         "/update/counter/TestMetric/1",
+			},
+		},
+		{
+			name: "check URL, negative",
+			responsedata: responsedata{
+				code:        http.StatusNotFound,
+				response:    "",
+				contentType: "",
+			},
+			requestdata: requestdata{
+				method:      http.MethodPost,
+				contentType: "text/plain",
+				url:         "/update/counter/TestMetric/1/2",
+			},
+		},
+		{
+			name: "check metricType, negative",
+			responsedata: responsedata{
+				code:        http.StatusBadRequest,
+				response:    "",
+				contentType: "",
+			},
+			requestdata: requestdata{
+				method:      http.MethodPost,
+				contentType: "text/plain",
+				url:         "/update/sdsdsd/TestMetric/1",
+			},
+		},
+		{
+			name: "check metricName, negative",
+			responsedata: responsedata{
+				code:        http.StatusNotFound,
+				response:    "",
+				contentType: "",
+			},
+			requestdata: requestdata{
+				method:      http.MethodPost,
+				contentType: "text/plain",
+				url:         "/update/counter//1",
+			},
+		},
+		{
+			name: "check counter, negative",
+			responsedata: responsedata{
+				code:        http.StatusBadRequest,
+				response:    "",
+				contentType: "",
+			},
+			requestdata: requestdata{
+				method:      http.MethodPost,
+				contentType: "text/plain",
+				url:         "/update/counter/SomeCount/one",
+			},
+		},
+		{
+			name: "check Gauge, negative",
+			responsedata: responsedata{
+				code:        http.StatusBadRequest,
+				response:    "",
+				contentType: "",
+			},
+			requestdata: requestdata{
+				method:      http.MethodPost,
+				contentType: "text/plain",
+				url:         "/update/gauge/SomeGauge/one",
+			},
+		},
+		{
+			name: "Check counter",
+			responsedata: responsedata{
+				code:        http.StatusOK,
+				response:    "",
+				contentType: "",
+			},
+			requestdata: requestdata{
+				method:      http.MethodPost,
+				contentType: "text/plain",
+				url:         "/update/counter/SomeCounter/1",
+			},
+		},
+		{
+			name: "Check Gauge",
+			responsedata: responsedata{
+				code:        http.StatusOK,
+				response:    "",
+				contentType: "",
+			},
+			requestdata: requestdata{
+				method:      http.MethodPost,
+				contentType: "text/plain",
+				url:         "/update/gauge/SomeCounter/1",
 			},
 		},
 	}
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			request := httptest.NewRequest(tt.requestdata.method, "/update/counter/TestMetric/1", nil)
+			request := httptest.NewRequest(tt.requestdata.method, tt.requestdata.url, nil)
 			request.Header.Add("Content-Type", tt.requestdata.contentType)
 			w := httptest.NewRecorder()
 			s := &storage.MemStorage{
