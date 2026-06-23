@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -34,6 +35,9 @@ func Update(w http.ResponseWriter, r *http.Request, storage storage.Storage) {
 	metricType := parts[2]
 	metricName := parts[3]
 	metricValue := parts[4]
+
+	fmt.Printf("recieved metric: %s, value: %s, type: %s", metricName, metricValue, metricType)
+	fmt.Println()
 
 	if metricType != "gauge" && metricType != "counter" {
 		w.WriteHeader(http.StatusBadRequest)
