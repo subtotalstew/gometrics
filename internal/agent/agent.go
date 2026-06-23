@@ -1,0 +1,150 @@
+package agent
+
+import (
+	"bytes"
+	"fmt"
+	"math/rand"
+	"net/http"
+	"runtime"
+	"time"
+)
+
+type Collector struct {
+	gauge   map[string]float64
+	counter map[string]int64
+}
+
+func NewCollector() *Collector {
+	return &Collector{
+		gauge:   make(map[string]float64),
+		counter: make(map[string]int64),
+	}
+}
+
+func (c *Collector) UpdateMetrics() {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+
+	c.gauge["Alloc"] = float64(m.Alloc)
+	c.gauge["BuckHashSys"] = float64(m.BuckHashSys)
+	c.gauge["Frees"] = float64(m.Frees)
+	c.gauge["GCCPUFraction"] = m.GCCPUFraction
+	c.gauge["GCSys"] = float64(m.GCSys)
+	c.gauge["HeapAlloc"] = float64(m.HeapAlloc)
+	c.gauge["HeapIdle"] = float64(m.HeapIdle)
+	c.gauge["HeapInuse"] = float64(m.HeapInuse)
+	c.gauge["HeapObjects"] = float64(m.HeapObjects)
+	c.gauge["HeapReleased"] = float64(m.HeapReleased)
+	c.gauge["HeapSys"] = float64(m.HeapSys)
+	c.gauge["LastGC"] = float64(m.LastGC)
+	c.gauge["Lookups"] = float64(m.Lookups)
+	c.gauge["MCacheInuse"] = float64(m.MCacheInuse)
+	c.gauge["MCacheSys"] = float64(m.MCacheSys)
+	c.gauge["MSpanInuse"] = float64(m.MSpanInuse)
+	c.gauge["MSpanSys"] = float64(m.MSpanSys)
+	c.gauge["Mallocs"] = float64(m.Mallocs)
+	c.gauge["NextGC"] = float64(m.NextGC)
+	c.gauge["NumForcedGC"] = float64(m.NumForcedGC)
+	c.gauge["NumGC"] = float64(m.NumGC)
+	c.gauge["OtherSys"] = float64(m.OtherSys)
+	c.gauge["PauseTotalNs"] = float64(m.PauseTotalNs)
+	c.gauge["StackInuse"] = float64(m.StackInuse)
+	c.gauge["StackSys"] = float64(m.StackSys)
+	c.gauge["Sys"] = float64(m.Sys)
+	c.gauge["TotalAlloc"] = float64(m.TotalAlloc)
+	c.gauge["RandomValue"] = rand.Float64()
+	c.counter["PollCount"]++
+}
+
+func (c *Collector) GetGauge() map[string]float64 {
+	result := make(map[string]float64)
+	for k, v := range c.gauge {
+		result[k] = v
+	}
+	return result
+}
+
+func (c *Collector) GetCounter() map[string]int64 {
+	result := make(map[string]int64)
+	for k, v := range c.counter {
+		result[k] = v
+	}
+	return result
+}
+
+type Agent struct {
+	collector      *Collector
+	serverAddr     string
+	pollInterval   int
+	reportInterval int
+}
+
+func NewAgent(serverAddr string, pollInterval, reportInterval int) *Agent {
+	return &Agent{
+		collector:      NewCollector(),
+		serverAddr:     serverAddr,
+		pollInterval:   pollInterval,
+		reportInterval: reportInterval,
+	}
+}
+
+func (a *Agent) Run() {
+	fmt.Println("Starting agent...")
+
+	a.collector.UpdateMetrics()
+	a.sendMetrics()
+	fmt.Println("Initial metrics collected and sent")
+
+	seconds := 0
+
+	for {
+		time.Sleep(1 * time.Second)
+
+		seconds++
+
+		if seconds%a.pollInterval == 0 {
+			a.collector.UpdateMetrics()
+			fmt.Printf("[%d sec] Metrics updated. PollCount: %d\n",
+				seconds, a.collector.counter["PollCount"])
+		}
+
+		if seconds%a.reportInterval == 0 {
+			a.sendMetrics()
+			fmt.Printf("[%d sec] Metrics sent to server\n", seconds)
+		}
+	}
+}
+
+func (a *Agent) sendMetrics() {
+	for name, value := range a.collector.GetGauge() {
+		a.sendMetric("gauge", name, value)
+	}
+
+	for name, value := range a.collector.GetCounter() {
+		a.sendMetric("counter", name, value)
+	}
+}
+
+func (a *Agent) sendMetric(metricType, name string, value interface{}) {
+	url := fmt.Sprintf("%s/update/%s/%s/%v", a.serverAddr, metricType, name, value)
+
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewBuffer([]byte{}))
+	if err != nil {
+		fmt.Printf("Error creating request for %s: %v\n", name, err)
+		return
+	}
+
+	req.Header.Set("Content-Type", "text/plain")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		fmt.Printf("Error sending metric %s: %v\n", name, err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		fmt.Printf("Unexpected status code for %s: %d\n", name, resp.StatusCode)
+	}
+}
