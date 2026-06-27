@@ -1,14 +1,29 @@
 package main
 
 import (
+	"flag"
+	"log"
+
 	"github.com/subtotalstew/gometrics.git/internal/agent"
 )
 
 func main() {
-	serverAddr := "http://localhost:8080"
-	pollInterval := 2
-	reportInterval := 10
+	var (
+		addr           string
+		pollInterval   int
+		reportInterval int
+	)
 
-	a := agent.NewAgent(serverAddr, pollInterval, reportInterval)
+	flag.StringVar(&addr, "a", "localhost:8080", "server address")
+	flag.IntVar(&pollInterval, "p", 2, "poll interval in seconds")
+	flag.IntVar(&reportInterval, "r", 10, "report interval in seconds")
+
+	flag.Parse()
+
+	if flag.NFlag() > 3 {
+		flag.Usage()
+		log.Fatal("Check startup arguments!!...startup Failed.")
+	}
+	a := agent.NewAgent("http://"+addr, pollInterval, reportInterval)
 	a.Run()
 }

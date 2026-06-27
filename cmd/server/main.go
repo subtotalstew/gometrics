@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"log"
 	"net/http"
 
@@ -11,6 +12,18 @@ import (
 )
 
 func main() {
+	var addr string
+	flag.StringVar(&addr, "a", "localhost:8080", "address and port to run server, format: <hostname>:<port>")
+
+	flag.Parse()
+
+	if flag.NFlag() > 1 {
+		flag.Usage()
+		log.Fatal("Check startup arguments!!...startup Failed.")
+	}
+
+	log.Printf("Starting server on %s", addr)
+
 	memstorage := storage.NewMemStorage()
 	h := handler.NewHandler(memstorage)
 	r := chi.NewRouter()
@@ -22,8 +35,7 @@ func main() {
 	r.Get("/value/{type}/{name}", h.ValueHandler)
 	r.Get("/", h.RootHandler)
 
-	log.Println("Starting server on :8080")
-	if err := http.ListenAndServe(":8080", r); err != nil {
+	if err := http.ListenAndServe(addr, r); err != nil {
 		log.Fatal(err)
 	}
 }

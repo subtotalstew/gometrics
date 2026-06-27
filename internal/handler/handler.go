@@ -20,20 +20,22 @@ func NewHandler(storage storage.Storage) *Handler {
 
 func (h *Handler) UpdateHandler(w http.ResponseWriter, r *http.Request) {
 
-	for k, v := range r.Header {
-		fmt.Printf("Got Header: %s with Value: %s", k, v)
-		fmt.Println()
-	}
+	// fmt.Printf("Got new request: %s", r.URL)
+	// fmt.Println()
+	// for k, v := range r.Header {
+	// 	fmt.Printf("Got Header: %s with Value: %s", k, v)
+	// 	fmt.Println()
+	// }
 
 	metricType := chi.URLParam(r, "type")
 	metricName := chi.URLParam(r, "name")
 	metricValue := chi.URLParam(r, "value")
 
-	contentType := r.Header.Get("Content-Type")
-	if contentType != "text/plain" {
-		http.Error(w, "Content-Type not text/plain.", http.StatusUnsupportedMediaType)
-		return
-	}
+	// contentType := r.Header.Get("Content-Type")
+	// if contentType != "text/plain" {
+	// 	http.Error(w, "Content-Type not text/plain.", http.StatusUnsupportedMediaType)
+	// 	return
+	// }
 
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not Allowed.", http.StatusMethodNotAllowed)
