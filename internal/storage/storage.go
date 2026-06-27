@@ -15,7 +15,17 @@ func (m *MemStorage) UpdateCounter(name string, value int64) error {
 	return nil
 }
 
+func (m *MemStorage) GetCounter(name string) int64 {
+	return m.Counter[name]
+}
+
+func (m *MemStorage) GetGauge(name string) float64 {
+	return m.Gauge[name]
+}
+
 type Storage interface {
 	SetGauge(name string, value float64) error
 	UpdateCounter(name string, value int64) error
+	GetCounter(name string) int64
+	GetGauge(name string) float64
 }
