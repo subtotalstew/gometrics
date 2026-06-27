@@ -23,11 +23,12 @@ func (h *Handler) UpdateHandler(w http.ResponseWriter, r *http.Request) {
 	metricName := chi.URLParam(r, "name")
 	metricValue := chi.URLParam(r, "value")
 
-	// contentType := r.Header.Get("Content-Type")
-	// if contentType != "text/plain" {
-	// 	http.Error(w, "Content-Type not text/plain.", http.StatusUnsupportedMediaType)
-	// 	return
-	// }
+	contentType := r.Header.Get("Content-Type")
+	if contentType != "text/plain" {
+		http.Error(w, "Content-Type not text/plain.", http.StatusUnsupportedMediaType)
+		fmt.Println("GOT HEADER: %v", r.Header.Get("Content-Type"))
+		return
+	}
 
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not Allowed.", http.StatusMethodNotAllowed)
