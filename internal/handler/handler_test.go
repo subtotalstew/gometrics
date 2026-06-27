@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/go-playground/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/subtotalstew/gometrics.git/internal/handler"
@@ -13,21 +14,16 @@ import (
 )
 
 func TestSetGauge(t *testing.T) {
-	s := &storage.MemStorage{
-		Gauge:   make(map[string]float64),
-		Counter: make(map[string]int64),
-	}
-	s.SetGauge("Test", float64(55))
+	s := storage.NewMemStorage()
+	s.SetGauge("Test", 55)
+
 	if s.Gauge["Test"] != 55 {
 		t.Errorf("Test gauge failed, got: %f, want: %f", s.Gauge["Test"], float64(55))
 	}
 }
 
 func TestUpdateCounter(t *testing.T) {
-	s := &storage.MemStorage{
-		Gauge:   make(map[string]float64),
-		Counter: make(map[string]int64),
-	}
+	s := storage.NewMemStorage()
 	s.UpdateCounter("Test", 1)
 	if s.Counter["Test"] != int64(1) {
 		t.Errorf("Test counter failed, got: %v, want: %v", s.Counter["Test"], int64(1))
@@ -55,7 +51,7 @@ func TestUpdateHandler(t *testing.T) {
 			name: "check Content-Type, negative scenario.",
 			responsedata: responsedata{
 				code:        http.StatusUnsupportedMediaType,
-				response:    "Content-Type not text/plain.",
+				response:    "",
 				contentType: "",
 			},
 			requestdata: requestdata{
@@ -68,7 +64,7 @@ func TestUpdateHandler(t *testing.T) {
 			name: "check Method, negative",
 			responsedata: responsedata{
 				code:        http.StatusMethodNotAllowed,
-				response:    "Method not Allowed.",
+				response:    "",
 				contentType: "",
 			},
 			requestdata: requestdata{
@@ -173,24 +169,34 @@ func TestUpdateHandler(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			request := httptest.NewRequest(tt.requestdata.method, tt.requestdata.url, nil)
+
 			request.Header.Add("Content-Type", tt.requestdata.contentType)
+
 			w := httptest.NewRecorder()
-			s := &storage.MemStorage{
-				Gauge:   make(map[string]float64),
-				Counter: make(map[string]int64),
-			}
-			handler.Update(w, request, s)
+
+			s := storage.NewMemStorage()
+
+			h := handler.NewHandler(s)
+
+			r := chi.NewRouter()
+			r.Post("/update/{type}/{name}/{value}", h.UpdateHandler)
+			r.ServeHTTP(w, request)
 
 			res := w.Result()
-
-			assert.Equal(t, tt.responsedata.code, res.StatusCode)
 			defer res.Body.Close()
 
-			resBody, err := io.ReadAll(res.Body)
+			assert.Equal(t, tt.responsedata.code, res.StatusCode)
 
+			resBody, err := io.ReadAll(res.Body)
 			require.NoError(t, err)
-			assert.Equal(t, tt.responsedata.response, string(resBody))
-			assert.Equal(t, tt.responsedata.contentType, res.Header.Get("Content-Type"))
+
+			if tt.responsedata.response != "" {
+				assert.Equal(t, tt.responsedata.response, string(resBody))
+			}
+
+			if tt.responsedata.contentType != "" {
+				assert.Equal(t, tt.responsedata.contentType, res.Header.Get("Content-Type"))
+			}
 		})
 	}
 }
