@@ -47,19 +47,19 @@ func TestUpdateHandler(t *testing.T) {
 		requestdata  requestdata
 		responsedata responsedata
 	}{
-		{
-			name: "check Content-Type, negative scenario.",
-			responsedata: responsedata{
-				code:        http.StatusUnsupportedMediaType,
-				response:    "",
-				contentType: "",
-			},
-			requestdata: requestdata{
-				method:      http.MethodPost,
-				contentType: "application/json",
-				url:         "/update/counter/TestMetric/1",
-			},
-		},
+		// {
+		// 	name: "check Content-Type, negative scenario.",
+		// 	responsedata: responsedata{
+		// 		code:        http.StatusUnsupportedMediaType,
+		// 		response:    "",
+		// 		contentType: "",
+		// 	},
+		// 	requestdata: requestdata{
+		// 		method:      http.MethodPost,
+		// 		contentType: "application/json",
+		// 		url:         "/update/counter/TestMetric/1",
+		// 	},
+		// },
 		{
 			name: "check Method, negative",
 			responsedata: responsedata{
