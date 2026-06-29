@@ -22,12 +22,15 @@ func (m *MemStorage) UpdateCounter(name string, value int64) error {
 	return nil
 }
 
-func (m *MemStorage) GetCounter(name string) int64 {
-	return m.Counter[name]
+func (m *MemStorage) GetCounter(name string) (int64, bool) {
+	value, ok := m.Counter[name]
+	return value, ok
 }
 
-func (m *MemStorage) GetGauge(name string) float64 {
-	return m.Gauge[name]
+func (m *MemStorage) GetGauge(name string) (float64, bool) {
+	value, ok := m.Gauge[name]
+	return value, ok
+
 }
 
 func (m *MemStorage) GetAllMetrics() (map[string]float64, map[string]int64) {
@@ -37,7 +40,7 @@ func (m *MemStorage) GetAllMetrics() (map[string]float64, map[string]int64) {
 type Storage interface {
 	SetGauge(name string, value float64) error
 	UpdateCounter(name string, value int64) error
-	GetCounter(name string) int64
-	GetGauge(name string) float64
+	GetCounter(name string) (int64, bool)
+	GetGauge(name string) (float64, bool)
 	GetAllMetrics() (map[string]float64, map[string]int64)
 }

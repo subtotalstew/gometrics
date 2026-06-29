@@ -52,6 +52,7 @@ func (h *Handler) UpdateHandler(w http.ResponseWriter, r *http.Request) {
 		value, err := strconv.ParseFloat(metricValue, 64)
 		if err != nil {
 			http.Error(w, "Invalid gauge value", http.StatusBadRequest)
+			return
 		}
 		if err := h.storage.SetGauge(metricName, value); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -82,21 +83,20 @@ func (h *Handler) ValueHandler(w http.ResponseWriter, r *http.Request) {
 
 	switch metricType {
 	case "gauge":
-		gauges, _ := h.storage.GetAllMetrics()
-		if _, exists := gauges[metricName]; !exists {
+		value, exists := h.storage.GetGauge(metricName)
+		if !exists {
 			http.Error(w, "Metric not found", http.StatusNotFound)
 			return
 		}
-		value := h.storage.GetGauge(metricName)
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintf(w, "%g", value)
 	case "counter":
-		_, counters := h.storage.GetAllMetrics()
-		if _, exists := counters[metricName]; !exists {
+		value, exists := h.storage.GetCounter(metricName)
+		if !exists {
 			http.Error(w, "Metric not found", http.StatusNotFound)
 			return
 		}
-		value := h.storage.GetCounter(metricName)
+		w.WriteHeader(http.StatusOK)
 		fmt.Fprintf(w, "%d", value)
 
 	default:

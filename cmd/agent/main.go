@@ -2,7 +2,6 @@ package main
 
 import (
 	"flag"
-	"log"
 
 	"github.com/subtotalstew/gometrics.git/internal/agent"
 )
@@ -20,10 +19,6 @@ func main() {
 
 	flag.Parse()
 
-	if flag.NFlag() > 3 {
-		flag.Usage()
-		log.Fatal("Check startup arguments!!...startup Failed.")
-	}
 	a := agent.NewAgent("http://"+addr, pollInterval, reportInterval)
 	a.Run()
 }

@@ -36,7 +36,10 @@ func TestSetGauge(t *testing.T) {
 			if err != nil {
 				t.Errorf("SetGauge() error = %v, want nil", err)
 			}
-			got := storage.GetGauge(tt.name)
+			got, exists := storage.GetGauge(tt.name)
+			if !exists {
+				t.Errorf("GetGauge() exists = false, want true")
+			}
 			if got != tt.value {
 				t.Errorf("GetGauge() = %v, want %v", got, tt.value)
 			}
@@ -68,7 +71,10 @@ func TestUpdateCounter(t *testing.T) {
 				}
 			}
 
-			got := storage.GetCounter(tt.name)
+			got, exists := storage.GetCounter(tt.name)
+			if !exists {
+				t.Errorf("GetCounter() exists = false, want true")
+			}
 			if got != tt.expected {
 				t.Errorf("GetCounter() = %v, want %v", got, tt.expected)
 			}

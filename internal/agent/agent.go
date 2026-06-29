@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"math/rand"
 	"net/http"
+	"os"
+	"os/signal"
 	"runtime"
+	"syscall"
 	"time"
 )
 
@@ -91,26 +94,30 @@ func NewAgent(serverAddr string, pollInterval, reportInterval int) *Agent {
 func (a *Agent) Run() {
 	fmt.Println("Starting agent...")
 
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	pollTicker := time.NewTicker(time.Duration(a.pollInterval) * time.Second)
+	defer pollTicker.Stop()
+
+	reportTicker := time.NewTicker(time.Duration(a.reportInterval) * time.Second)
+	defer reportTicker.Stop()
+
 	a.collector.UpdateMetrics()
 	a.sendMetrics()
 	fmt.Println("Initial metrics collected and sent")
 
-	seconds := 0
-
 	for {
-		time.Sleep(1 * time.Second)
-
-		seconds++
-
-		if seconds%a.pollInterval == 0 {
+		select {
+		case <-pollTicker.C:
 			a.collector.UpdateMetrics()
-			fmt.Printf("[%d sec] Metrics updated. PollCount: %d\n",
-				seconds, a.collector.counter["PollCount"])
-		}
-
-		if seconds%a.reportInterval == 0 {
+			fmt.Printf("Metrics updated. PollCount: %d\n", a.collector.counter["PollCount"])
+		case <-reportTicker.C:
 			a.sendMetrics()
-			fmt.Printf("[%d sec] Metrics sent to server\n", seconds)
+			fmt.Printf("Metrics sent to server\n")
+		case signal := <-sigChan:
+			fmt.Printf("Received signal %v. Agent is shutting down gracefully...\n", signal)
+			return
 		}
 	}
 }

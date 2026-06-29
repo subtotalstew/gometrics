@@ -17,11 +17,6 @@ func main() {
 
 	flag.Parse()
 
-	if flag.NFlag() > 1 {
-		flag.Usage()
-		log.Fatal("Check startup arguments!!...startup Failed.")
-	}
-
 	log.Printf("Starting server on %s", addr)
 
 	memstorage := storage.NewMemStorage()
