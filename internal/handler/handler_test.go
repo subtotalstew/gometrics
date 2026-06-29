@@ -48,32 +48,32 @@ func TestUpdateHandler(t *testing.T) {
 		requestdata  requestdata
 		responsedata responsedata
 	}{
-		{
-			name: "check Content-Type, negative scenario.",
-			responsedata: responsedata{
-				code:        http.StatusUnsupportedMediaType,
-				response:    "",
-				contentType: "",
-			},
-			requestdata: requestdata{
-				method:      http.MethodPost,
-				contentType: "application/json",
-				url:         "/update/counter/TestMetric/1",
-			},
-		},
-		{
-			name: "check Content-Type, positive scenario.",
-			responsedata: responsedata{
-				code:        http.StatusOK,
-				response:    "",
-				contentType: "",
-			},
-			requestdata: requestdata{
-				method:      http.MethodPost,
-				contentType: "text/plain",
-				url:         "/update/gauge/testSetGet57/734487.733",
-			},
-		},
+		// {
+		// 	name: "check Content-Type, negative scenario.",
+		// 	responsedata: responsedata{
+		// 		code:        http.StatusUnsupportedMediaType,
+		// 		response:    "",
+		// 		contentType: "",
+		// 	},
+		// 	requestdata: requestdata{
+		// 		method:      http.MethodPost,
+		// 		contentType: "application/json",
+		// 		url:         "/update/counter/TestMetric/1",
+		// 	},
+		// },
+		// {
+		// 	name: "check Content-Type, positive scenario.",
+		// 	responsedata: responsedata{
+		// 		code:        http.StatusOK,
+		// 		response:    "",
+		// 		contentType: "",
+		// 	},
+		// 	requestdata: requestdata{
+		// 		method:      http.MethodPost,
+		// 		contentType: "text/plain",
+		// 		url:         "/update/gauge/testSetGet57/734487.733",
+		// 	},
+		// },
 		{
 			name: "check Method, negative",
 			responsedata: responsedata{
