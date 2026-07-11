@@ -5,8 +5,10 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/rs/zerolog/log"
 	"github.com/subtotalstew/gometrics.git/internal/storage"
 )
 
@@ -20,22 +22,9 @@ func NewHandler(storage storage.Storage) *Handler {
 
 func (h *Handler) UpdateHandler(w http.ResponseWriter, r *http.Request) {
 
-	// fmt.Printf("Got new request: %s", r.URL)
-	// fmt.Println()
-	// for k, v := range r.Header {
-	// 	fmt.Printf("Got Header: %s with Value: %s", k, v)
-	// 	fmt.Println()
-	// }
-
 	metricType := chi.URLParam(r, "type")
 	metricName := chi.URLParam(r, "name")
 	metricValue := chi.URLParam(r, "value")
-
-	// contentType := r.Header.Get("Content-Type")
-	// if contentType != "text/plain" {
-	// 	http.Error(w, "Content-Type not text/plain.", http.StatusUnsupportedMediaType)
-	// 	return
-	// }
 
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not Allowed.", http.StatusMethodNotAllowed)
@@ -153,4 +142,48 @@ func (h *Handler) RootHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html")
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(html.String()))
+}
+
+type loggingResponseWriter struct {
+	http.ResponseWriter
+	status int
+	size   int
+}
+
+func (lrw *loggingResponseWriter) WriteHeader(code int) {
+	lrw.status = code
+	lrw.ResponseWriter.WriteHeader(code)
+}
+
+func (lrw *loggingResponseWriter) Write(b []byte) (int, error) {
+	if lrw.status == 0 {
+		lrw.status = http.StatusOK
+	}
+	size, err := lrw.ResponseWriter.Write(b)
+	lrw.size += size
+	return size, err
+}
+
+func (h *Handler) LoggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+
+		start := time.Now()
+
+		lrw := &loggingResponseWriter{
+			ResponseWriter: w,
+			status:         http.StatusOK,
+		}
+
+		next.ServeHTTP(lrw, r)
+
+		duration := time.Since(start)
+
+		log.Info().
+			Str("uri", r.RequestURI).
+			Str("method", r.Method).
+			Str("duration", duration.String()).
+			Int("status", lrw.status).
+			Int("size", lrw.size).
+			Msg("HTTP request processed")
+	})
 }

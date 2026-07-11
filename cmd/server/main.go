@@ -2,17 +2,18 @@ package main
 
 import (
 	"flag"
-	"log"
 	"net/http"
 	"os"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/rs/zerolog/log"
 	"github.com/subtotalstew/gometrics.git/internal/handler"
 	"github.com/subtotalstew/gometrics.git/internal/storage"
 )
 
 func main() {
+
 	var addr string
 	flag.StringVar(&addr, "a", "localhost:8080", "address and port to run server, format: <hostname>:<port>")
 
@@ -21,14 +22,13 @@ func main() {
 	if envAddr := os.Getenv("ADDRESS"); envAddr != "" {
 		addr = envAddr
 	}
-
-	log.Printf("Starting server on %s", addr)
+	log.Info().Msgf("Starting server on %s", addr)
 
 	memstorage := storage.NewMemStorage()
 	h := handler.NewHandler(memstorage)
 	r := chi.NewRouter()
 
-	r.Use(middleware.Logger)
+	r.Use(h.LoggingMiddleware)
 	r.Use(middleware.Recoverer)
 
 	r.Post("/update/{type}/{name}/{value}", h.UpdateHandler)
@@ -36,6 +36,6 @@ func main() {
 	r.Get("/", h.RootHandler)
 
 	if err := http.ListenAndServe(addr, r); err != nil {
-		log.Fatal(err)
+		log.Fatal().Msg(err.Error())
 	}
 }
