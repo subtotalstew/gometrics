@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/rs/zerolog/log"
+	models "github.com/subtotalstew/gometrics.git/internal/model"
 	"github.com/subtotalstew/gometrics.git/internal/storage"
 )
 
@@ -186,4 +188,86 @@ func (h *Handler) LoggingMiddleware(next http.Handler) http.Handler {
 			Int("size", lrw.size).
 			Msg("HTTP request processed")
 	})
+}
+
+func (h *Handler) ValueJSONHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	var req models.Metrics
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+
+	switch req.MType {
+	case models.Gauge:
+		value, exists := h.storage.GetGauge(req.ID)
+		if !exists {
+			http.Error(w, `{"error":"metric not found"}`, http.StatusNotFound)
+			return
+		}
+		req.Value = &value
+
+	case models.Counter:
+		value, exists := h.storage.GetCounter(req.ID)
+		if !exists {
+			http.Error(w, `{"error":"metric not found"}`, http.StatusNotFound)
+			return
+		}
+		req.Delta = &value
+
+	default:
+		http.Error(w, `{"error":"invalid metric type"}`, http.StatusBadRequest)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(req)
+}
+
+func (h *Handler) UpdateJSONHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	var req models.Metrics
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+
+	if req.ID == "" {
+		http.Error(w, `{"error":"metric name is empty"}`, http.StatusNotFound)
+		return
+	}
+
+	switch req.MType {
+	case models.Gauge:
+		if req.Value == nil {
+			http.Error(w, `{"error":"missing value for gauge"}`, http.StatusBadRequest)
+			return
+		}
+		if err := h.storage.SetGauge(req.ID, *req.Value); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+	case models.Counter:
+		if req.Delta == nil {
+			http.Error(w, `{"error":"missing delta for counter"}`, http.StatusBadRequest)
+			return
+		}
+		if err := h.storage.UpdateCounter(req.ID, *req.Delta); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		// По ТЗ возвращаем обновленное суммарное значение counter
+		current, _ := h.storage.GetCounter(req.ID)
+		req.Delta = &current
+
+	default:
+		http.Error(w, `{"error":"invalid metric type"}`, http.StatusBadRequest)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(req)
 }

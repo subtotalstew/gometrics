@@ -2,6 +2,7 @@ package agent
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"math/rand"
 	"net/http"
@@ -10,6 +11,8 @@ import (
 	"runtime"
 	"syscall"
 	"time"
+
+	models "github.com/subtotalstew/gometrics.git/internal/model"
 )
 
 type Collector struct {
@@ -123,35 +126,54 @@ func (a *Agent) Run() {
 }
 
 func (a *Agent) sendMetrics() {
+	client := &http.Client{Timeout: 5 * time.Second}
+
 	for name, value := range a.collector.GetGauge() {
-		a.sendMetric("gauge", name, value)
+		valCopy := value
+		m := models.Metrics{
+			ID:    name,
+			MType: models.Gauge,
+			Value: &valCopy,
+		}
+		a.sendMetricJSON(client, m)
 	}
 
 	for name, value := range a.collector.GetCounter() {
-		a.sendMetric("counter", name, value)
+		deltaCopy := value
+		m := models.Metrics{
+			ID:    name,
+			MType: models.Counter,
+			Delta: &deltaCopy,
+		}
+		a.sendMetricJSON(client, m)
 	}
 }
 
-func (a *Agent) sendMetric(metricType, name string, value interface{}) {
-	url := fmt.Sprintf("%s/update/%s/%s/%v", a.serverAddr, metricType, name, value)
+func (a *Agent) sendMetricJSON(client *http.Client, metric models.Metrics) {
+	url := fmt.Sprintf("%s/update", a.serverAddr)
 
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewBuffer([]byte{}))
+	body, err := json.Marshal(metric)
 	if err != nil {
-		fmt.Printf("Error creating request for %s: %v\n", name, err)
+		fmt.Printf("Error marshaling metric %s: %v\n", metric.ID, err)
 		return
 	}
 
-	req.Header.Set("Content-Type", "text/plain")
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewBuffer(body))
+	if err != nil {
+		fmt.Printf("Error creating request for %s: %v\n", metric.ID, err)
+		return
+	}
 
-	client := &http.Client{Timeout: 5 * time.Second}
+	req.Header.Set("Content-Type", "application/json")
+
 	resp, err := client.Do(req)
 	if err != nil {
-		fmt.Printf("Error sending metric %s: %v\n", name, err)
+		fmt.Printf("Error sending metric %s: %v\n", metric.ID, err)
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		fmt.Printf("Unexpected status code for %s: %d\n", name, resp.StatusCode)
+		fmt.Printf("Unexpected status code for %s: %d\n", metric.ID, resp.StatusCode)
 	}
 }
