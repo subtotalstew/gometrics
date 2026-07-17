@@ -2,6 +2,7 @@ package agent
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"math/rand"
@@ -160,7 +161,6 @@ func (a *Agent) sendMetrics() {
 
 func (a *Agent) sendMetricJSON(client *http.Client, metric models.Metrics) {
 	url := fmt.Sprintf("%s/update", a.serverAddr)
-
 	body, err := json.Marshal(metric)
 	if err != nil {
 		log.Error().
@@ -171,7 +171,18 @@ func (a *Agent) sendMetricJSON(client *http.Client, metric models.Metrics) {
 		return
 	}
 
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewBuffer(body))
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	if _, err := gz.Write(body); err != nil {
+		log.Error().Err(err).Msg("failed to write gzip body")
+		return
+	}
+	if err := gz.Close(); err != nil {
+		log.Error().Err(err).Msg("failed to close gzip writer")
+		return
+	}
+
+	req, err := http.NewRequest(http.MethodPost, url, &buf)
 	if err != nil {
 		log.Error().
 			Err(err).
@@ -181,6 +192,15 @@ func (a *Agent) sendMetricJSON(client *http.Client, metric models.Metrics) {
 	}
 
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Encoding", "gzip")
+	req.Header.Set("Accept-Encoding", "gzip")
+
+	log.Debug().
+		Str("metric_id", metric.ID).
+		Int("original_size", len(body)).
+		Int("compressed_size", buf.Len()).
+		Interface("headers", req.Header).
+		Msg("sending outgoing agent request")
 
 	resp, err := client.Do(req)
 	if err != nil {

@@ -1,6 +1,8 @@
 package handler_test
 
 import (
+	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -362,4 +364,53 @@ func TestValueJSONHandler(t *testing.T) {
 	assert.Equal(t, "gauge", got.MType)
 	require.NotNil(t, got.Value)
 	assert.Equal(t, 1744184459.0, *got.Value)
+}
+
+func compressData(t *testing.T, data []byte) []byte {
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	_, err := gz.Write(data)
+	require.NoError(t, err)
+	require.NoError(t, gz.Close())
+	return buf.Bytes()
+}
+
+func TestGzipMiddleware_DecompressRequest(t *testing.T) {
+	s := storage.NewMemStorage()
+	h := handler.NewHandler(s)
+	r := chi.NewRouter()
+	r.Use(h.GzipMiddleware)
+	r.Post("/update", h.UpdateJSONHandler)
+
+	jsonBody := `{"id":"TestGzipGauge","type":"gauge","value":42.42}`
+	compressedBody := compressData(t, []byte(jsonBody))
+
+	req := httptest.NewRequest(http.MethodPost, "/update", bytes.NewReader(compressedBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Encoding", "gzip")
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Result().StatusCode)
+	val, _ := s.GetGauge("TestGzipGauge")
+	assert.Equal(t, 42.42, val)
+}
+
+func TestGzipMiddleware_CompressJSONResponse(t *testing.T) {
+	s := storage.NewMemStorage()
+	_ = s.SetGauge("TestGzipGauge", 100.5)
+	h := handler.NewHandler(s)
+	r := chi.NewRouter()
+	r.Use(h.GzipMiddleware)
+	r.Post("/value", h.ValueJSONHandler)
+
+	req := httptest.NewRequest(http.MethodPost, "/value", strings.NewReader(`{"id":"TestGzipGauge","type":"gauge"}`))
+	req.Header.Set("Accept-Encoding", "gzip")
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	res := w.Result()
+	assert.Equal(t, "gzip", res.Header.Get("Content-Encoding"))
 }

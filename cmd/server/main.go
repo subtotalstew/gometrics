@@ -28,6 +28,7 @@ func main() {
 	h := handler.NewHandler(memstorage)
 	r := chi.NewRouter()
 
+	r.Use(h.GzipMiddleware)
 	r.Use(h.LoggingMiddleware)
 	r.Use(middleware.Recoverer)
 

@@ -1,8 +1,11 @@
 package handler
 
 import (
+	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -168,24 +171,29 @@ func (lrw *loggingResponseWriter) Write(b []byte) (int, error) {
 
 func (h *Handler) LoggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-
 		start := time.Now()
 
-		lrw := &loggingResponseWriter{
-			ResponseWriter: w,
-			status:         http.StatusOK,
+		// Читаем и восстанавливаем тело запроса
+		var bodyBytes []byte
+		if r.Body != nil {
+			bodyBytes, _ = io.ReadAll(r.Body)
+			r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 		}
 
+		lrw := &loggingResponseWriter{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(lrw, r)
-
 		duration := time.Since(start)
 
+		// Логгируем детали запроса и ответа
 		log.Info().
 			Str("uri", r.RequestURI).
 			Str("method", r.Method).
 			Str("duration", duration.String()).
 			Int("status", lrw.status).
-			Int("size", lrw.size).
+			Interface("req_headers", map[string][]string{
+				"Content-Type": r.Header["Content-Type"], "Content-Encoding": r.Header["Content-Encoding"],
+			}).
+			Str("req_body_raw", string(bodyBytes)).
 			Msg("HTTP request processed")
 	})
 }
@@ -284,4 +292,96 @@ func (h *Handler) UpdateJSONHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(req)
+}
+
+type compressWriter struct {
+	http.ResponseWriter
+	w io.Writer
+}
+
+func (cw *compressWriter) Write(b []byte) (int, error) {
+	return cw.w.Write(b)
+}
+
+type compressReader struct {
+	r  io.ReadCloser
+	zr *gzip.Reader
+}
+
+func newCompressReader(r io.ReadCloser) (*compressReader, error) {
+	zr, err := gzip.NewReader(r)
+	if err != nil {
+		return nil, err
+	}
+	return &compressReader{r: r, zr: zr}, nil
+}
+
+func (cr compressReader) Read(p []byte) (n int, err error) {
+	return cr.zr.Read(p)
+}
+
+func (cr *compressReader) Close() error {
+	if err := cr.r.Close(); err != nil {
+		return err
+	}
+	return cr.zr.Close()
+}
+func (h *Handler) GzipMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ow := w
+
+		acceptEncoding := r.Header.Get("Accept-Encoding")
+		supportsGzip := strings.Contains(acceptEncoding, "gzip")
+
+		if supportsGzip {
+			gz, err := gzip.NewWriterLevel(w, gzip.BestSpeed)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			defer gz.Close()
+
+			ow = &compressWriter{ResponseWriter: w, w: gz}
+		}
+
+		contentEncoding := r.Header.Get("Content-Encoding")
+		sendedGzip := strings.Contains(contentEncoding, "gzip")
+
+		if sendedGzip {
+			cr, err := newCompressReader(r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			defer cr.Close()
+			r.Body = cr
+		}
+
+		finalWriter := &contentTypeCheckWriter{ResponseWriter: ow, rawWriter: w}
+
+		next.ServeHTTP(finalWriter, r)
+	})
+}
+
+type contentTypeCheckWriter struct {
+	http.ResponseWriter
+	rawWriter http.ResponseWriter
+}
+
+func (ctw *contentTypeCheckWriter) Write(b []byte) (int, error) {
+	contentType := ctw.Header().Get("Content-Type")
+	if strings.Contains(contentType, "application/json") || strings.Contains(contentType, "text/html") {
+		ctw.rawWriter.Header().Set("Content-Encoding", "gzip")
+	} else {
+		return ctw.rawWriter.Write(b)
+	}
+	return ctw.ResponseWriter.Write(b)
+}
+
+func (ctw *contentTypeCheckWriter) WriteHeader(statusCode int) {
+	contentType := ctw.Header().Get("Content-Type")
+	if strings.Contains(contentType, "application/json") || strings.Contains(contentType, "text/html") {
+		ctw.rawWriter.Header().Set("Content-Encoding", "gzip")
+	}
+	ctw.ResponseWriter.WriteHeader(statusCode)
 }
