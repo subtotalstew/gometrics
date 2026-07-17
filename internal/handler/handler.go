@@ -18,13 +18,23 @@ import (
 )
 
 type Handler struct {
-	storage storage.Storage
+	storage  storage.Storage
+	syncSave func()
 }
 
 func NewHandler(storage storage.Storage) *Handler {
 	return &Handler{storage: storage}
 }
 
+func (h *Handler) SetSyncSave(fn func()) {
+	h.syncSave = fn
+}
+
+func (h *Handler) trySyncSave() {
+	if h.syncSave != nil {
+		h.syncSave()
+	}
+}
 func (h *Handler) UpdateHandler(w http.ResponseWriter, r *http.Request) {
 
 	metricType := chi.URLParam(r, "type")
@@ -53,6 +63,7 @@ func (h *Handler) UpdateHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.WriteHeader(http.StatusOK)
+		h.trySyncSave()
 
 	case "counter":
 		value, err := strconv.ParseInt(metricValue, 10, 64)
@@ -65,6 +76,7 @@ func (h *Handler) UpdateHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.WriteHeader(http.StatusOK)
+		h.trySyncSave()
 
 	default:
 		http.Error(w, "Invalid metric type", http.StatusBadRequest)
@@ -272,6 +284,7 @@ func (h *Handler) UpdateJSONHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		h.trySyncSave()
 
 	case models.Counter:
 		if req.Delta == nil {
@@ -282,6 +295,7 @@ func (h *Handler) UpdateJSONHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		h.trySyncSave()
 		cur, _ := h.storage.GetCounter(req.ID)
 		req.Delta = &cur
 
