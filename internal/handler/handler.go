@@ -230,7 +230,7 @@ func (h *Handler) ValueJSONHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"invalid metric type"}`, http.StatusBadRequest)
 		return
 	}
-
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(req)
 }
@@ -281,7 +281,7 @@ func (h *Handler) UpdateJSONHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"invalid metric type"}`, http.StatusBadRequest)
 		return
 	}
-
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(req)
 }
