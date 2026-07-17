@@ -1,15 +1,18 @@
 package handler_test
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/subtotalstew/gometrics.git/internal/handler"
+	models "github.com/subtotalstew/gometrics.git/internal/model"
 	"github.com/subtotalstew/gometrics.git/internal/storage"
 )
 
@@ -283,4 +286,80 @@ func TestValueHandler(t *testing.T) {
 			assert.Equal(t, tt.wantBody, string(resBody))
 		})
 	}
+}
+
+func TestUpdateJSONHandler_Gauge(t *testing.T) {
+	s := storage.NewMemStorage()
+	h := handler.NewHandler(s)
+
+	body := `{"id":"LastGC","type":"gauge","value":1744184459}`
+	req := httptest.NewRequest(http.MethodPost, "/update", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	r := chi.NewRouter()
+	r.Post("/update", h.UpdateJSONHandler)
+	r.ServeHTTP(w, req)
+
+	res := w.Result()
+	defer res.Body.Close()
+
+	assert.Equal(t, http.StatusOK, res.StatusCode)
+	assert.Equal(t, "application/json", res.Header.Get("Content-Type"))
+
+	got, ok := s.GetGauge("LastGC")
+	require.True(t, ok)
+	assert.Equal(t, 1744184459.0, got)
+}
+
+func TestUpdateJSONHandler_Counter(t *testing.T) {
+	s := storage.NewMemStorage()
+	h := handler.NewHandler(s)
+
+	body := `{"id":"PollCount","type":"counter","delta":5}`
+	req := httptest.NewRequest(http.MethodPost, "/update", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	r := chi.NewRouter()
+	r.Post("/update", h.UpdateJSONHandler)
+	r.ServeHTTP(w, req)
+
+	res := w.Result()
+	defer res.Body.Close()
+
+	assert.Equal(t, http.StatusOK, res.StatusCode)
+	assert.Equal(t, "application/json", res.Header.Get("Content-Type"))
+
+	got, ok := s.GetCounter("PollCount")
+	require.True(t, ok)
+	assert.Equal(t, int64(5), got)
+}
+
+func TestValueJSONHandler(t *testing.T) {
+	s := storage.NewMemStorage()
+	_ = s.SetGauge("LastGC", 1744184459)
+	h := handler.NewHandler(s)
+
+	body := `{"id":"LastGC","type":"gauge"}`
+	req := httptest.NewRequest(http.MethodPost, "/value", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	r := chi.NewRouter()
+	r.Post("/value", h.ValueJSONHandler)
+	r.ServeHTTP(w, req)
+
+	res := w.Result()
+	defer res.Body.Close()
+
+	assert.Equal(t, http.StatusOK, res.StatusCode)
+	assert.Equal(t, "application/json", res.Header.Get("Content-Type"))
+
+	var got models.Metrics
+	require.NoError(t, json.NewDecoder(res.Body).Decode(&got))
+	assert.Equal(t, "LastGC", got.ID)
+	assert.Equal(t, "gauge", got.MType)
+	require.NotNil(t, got.Value)
+	assert.Equal(t, 1744184459.0, *got.Value)
 }

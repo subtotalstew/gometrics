@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/rs/zerolog/log"
 	models "github.com/subtotalstew/gometrics.git/internal/model"
 )
 
@@ -95,7 +96,11 @@ func NewAgent(serverAddr string, pollInterval, reportInterval int) *Agent {
 }
 
 func (a *Agent) Run() {
-	fmt.Println("Starting agent...")
+	log.Info().
+		Int("poll_interval", a.pollInterval).
+		Int("report_interval", a.reportInterval).
+		Str("server_addr", a.serverAddr).
+		Msg("starting agent")
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
@@ -108,18 +113,22 @@ func (a *Agent) Run() {
 
 	a.collector.UpdateMetrics()
 	a.sendMetrics()
-	fmt.Println("Initial metrics collected and sent")
+	log.Info().Msg("initial metrics collected and sent")
 
 	for {
 		select {
 		case <-pollTicker.C:
 			a.collector.UpdateMetrics()
-			fmt.Printf("Metrics updated. PollCount: %d\n", a.collector.counter["PollCount"])
+			log.Debug().
+				Int64("poll_count", a.collector.counter["PollCount"]).
+				Msg("metrics updated")
 		case <-reportTicker.C:
 			a.sendMetrics()
-			fmt.Printf("Metrics sent to server\n")
+			log.Info().Msg("metrics sent to server")
 		case signal := <-sigChan:
-			fmt.Printf("Received signal %v. Agent is shutting down gracefully...\n", signal)
+			log.Info().
+				Str("signal", signal.String()).
+				Msg("agent shutting down gracefully")
 			return
 		}
 	}
@@ -154,13 +163,20 @@ func (a *Agent) sendMetricJSON(client *http.Client, metric models.Metrics) {
 
 	body, err := json.Marshal(metric)
 	if err != nil {
-		fmt.Printf("Error marshaling metric %s: %v\n", metric.ID, err)
+		log.Error().
+			Err(err).
+			Str("metric", metric.ID).
+			Str("type", metric.MType).
+			Msg("failed to marshal metric")
 		return
 	}
 
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewBuffer(body))
 	if err != nil {
-		fmt.Printf("Error creating request for %s: %v\n", metric.ID, err)
+		log.Error().
+			Err(err).
+			Str("metric", metric.ID).
+			Msg("failed to create request")
 		return
 	}
 
@@ -168,12 +184,18 @@ func (a *Agent) sendMetricJSON(client *http.Client, metric models.Metrics) {
 
 	resp, err := client.Do(req)
 	if err != nil {
-		fmt.Printf("Error sending metric %s: %v\n", metric.ID, err)
+		log.Error().
+			Err(err).
+			Str("metric", metric.ID).
+			Msg("failed to send metric")
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		fmt.Printf("Unexpected status code for %s: %d\n", metric.ID, resp.StatusCode)
+		log.Warn().
+			Int("status_code", resp.StatusCode).
+			Str("metric", metric.ID).
+			Msg("unexpected response status")
 	}
 }

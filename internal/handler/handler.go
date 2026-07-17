@@ -193,9 +193,19 @@ func (h *Handler) LoggingMiddleware(next http.Handler) http.Handler {
 func (h *Handler) ValueJSONHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
+	if r.Header.Get("Content-Type") != "application/json" {
+		http.Error(w, `{"error":"unsupported content type"}`, http.StatusUnsupportedMediaType)
+		return
+	}
+
 	var req models.Metrics
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+
+	if req.ID == "" {
+		http.Error(w, `{"error":"metric name is empty"}`, http.StatusBadRequest)
 		return
 	}
 
@@ -222,11 +232,16 @@ func (h *Handler) ValueJSONHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(req)
+	_ = json.NewEncoder(w).Encode(req)
 }
 
 func (h *Handler) UpdateJSONHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+
+	if r.Header.Get("Content-Type") != "application/json" {
+		http.Error(w, `{"error":"unsupported content type"}`, http.StatusUnsupportedMediaType)
+		return
+	}
 
 	var req models.Metrics
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -235,7 +250,7 @@ func (h *Handler) UpdateJSONHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.ID == "" {
-		http.Error(w, `{"error":"metric name is empty"}`, http.StatusNotFound)
+		http.Error(w, `{"error":"metric name is empty"}`, http.StatusBadRequest)
 		return
 	}
 
@@ -259,9 +274,8 @@ func (h *Handler) UpdateJSONHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		// По ТЗ возвращаем обновленное суммарное значение counter
-		current, _ := h.storage.GetCounter(req.ID)
-		req.Delta = &current
+		cur, _ := h.storage.GetCounter(req.ID)
+		req.Delta = &cur
 
 	default:
 		http.Error(w, `{"error":"invalid metric type"}`, http.StatusBadRequest)
@@ -269,5 +283,5 @@ func (h *Handler) UpdateJSONHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(req)
+	_ = json.NewEncoder(w).Encode(req)
 }
