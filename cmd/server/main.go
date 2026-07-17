@@ -33,6 +33,8 @@ func main() {
 
 	r.Post("/update", h.UpdateJSONHandler)
 	r.Post("/value", h.ValueJSONHandler)
+	r.Post("/update/", h.UpdateJSONHandler)
+	r.Post("/value/", h.ValueJSONHandler)
 
 	r.Post("/update/{type}/{name}/{value}", h.UpdateHandler)
 	r.Get("/value/{type}/{name}", h.ValueHandler)
