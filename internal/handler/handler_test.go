@@ -406,11 +406,15 @@ func TestGzipMiddleware_CompressJSONResponse(t *testing.T) {
 	r.Post("/value", h.ValueJSONHandler)
 
 	req := httptest.NewRequest(http.MethodPost, "/value", strings.NewReader(`{"id":"TestGzipGauge","type":"gauge"}`))
+	req.Header.Set("Content-Type", "application/json") // <-- ДОБАВИТЬ ЭТУ СТРОКУ
 	req.Header.Set("Accept-Encoding", "gzip")
 
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
 	res := w.Result()
+	defer res.Body.Close()
+
+	assert.Equal(t, http.StatusOK, res.StatusCode)
 	assert.Equal(t, "gzip", res.Header.Get("Content-Encoding"))
 }
