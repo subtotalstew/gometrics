@@ -2,6 +2,8 @@ package agent
 
 import (
 	"bytes"
+	"compress/gzip"
+	"encoding/json"
 	"fmt"
 	"math/rand"
 	"net/http"
@@ -10,6 +12,9 @@ import (
 	"runtime"
 	"syscall"
 	"time"
+
+	"github.com/rs/zerolog/log"
+	models "github.com/subtotalstew/gometrics.git/internal/model"
 )
 
 type Collector struct {
@@ -92,7 +97,11 @@ func NewAgent(serverAddr string, pollInterval, reportInterval int) *Agent {
 }
 
 func (a *Agent) Run() {
-	fmt.Println("Starting agent...")
+	log.Info().
+		Int("poll_interval", a.pollInterval).
+		Int("report_interval", a.reportInterval).
+		Str("server_addr", a.serverAddr).
+		Msg("starting agent")
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
@@ -105,53 +114,108 @@ func (a *Agent) Run() {
 
 	a.collector.UpdateMetrics()
 	a.sendMetrics()
-	fmt.Println("Initial metrics collected and sent")
+	log.Info().Msg("initial metrics collected and sent")
 
 	for {
 		select {
 		case <-pollTicker.C:
 			a.collector.UpdateMetrics()
-			fmt.Printf("Metrics updated. PollCount: %d\n", a.collector.counter["PollCount"])
+			log.Debug().
+				Int64("poll_count", a.collector.counter["PollCount"]).
+				Msg("metrics updated")
 		case <-reportTicker.C:
 			a.sendMetrics()
-			fmt.Printf("Metrics sent to server\n")
+			log.Info().Msg("metrics sent to server")
 		case signal := <-sigChan:
-			fmt.Printf("Received signal %v. Agent is shutting down gracefully...\n", signal)
+			log.Info().
+				Str("signal", signal.String()).
+				Msg("agent shutting down gracefully")
 			return
 		}
 	}
 }
 
 func (a *Agent) sendMetrics() {
+	client := &http.Client{Timeout: 5 * time.Second}
+
 	for name, value := range a.collector.GetGauge() {
-		a.sendMetric("gauge", name, value)
+		valCopy := value
+		m := models.Metrics{
+			ID:    name,
+			MType: models.Gauge,
+			Value: &valCopy,
+		}
+		a.sendMetricJSON(client, m)
 	}
 
 	for name, value := range a.collector.GetCounter() {
-		a.sendMetric("counter", name, value)
+		deltaCopy := value
+		m := models.Metrics{
+			ID:    name,
+			MType: models.Counter,
+			Delta: &deltaCopy,
+		}
+		a.sendMetricJSON(client, m)
 	}
 }
 
-func (a *Agent) sendMetric(metricType, name string, value interface{}) {
-	url := fmt.Sprintf("%s/update/%s/%s/%v", a.serverAddr, metricType, name, value)
-
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewBuffer([]byte{}))
+func (a *Agent) sendMetricJSON(client *http.Client, metric models.Metrics) {
+	url := fmt.Sprintf("%s/update", a.serverAddr)
+	body, err := json.Marshal(metric)
 	if err != nil {
-		fmt.Printf("Error creating request for %s: %v\n", name, err)
+		log.Error().
+			Err(err).
+			Str("metric", metric.ID).
+			Str("type", metric.MType).
+			Msg("failed to marshal metric")
 		return
 	}
 
-	req.Header.Set("Content-Type", "text/plain")
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	if _, err := gz.Write(body); err != nil {
+		log.Error().Err(err).Msg("failed to write gzip body")
+		return
+	}
+	if err := gz.Close(); err != nil {
+		log.Error().Err(err).Msg("failed to close gzip writer")
+		return
+	}
 
-	client := &http.Client{Timeout: 5 * time.Second}
+	req, err := http.NewRequest(http.MethodPost, url, &buf)
+	if err != nil {
+		log.Error().
+			Err(err).
+			Str("metric", metric.ID).
+			Msg("failed to create request")
+		return
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Encoding", "gzip")
+	req.Header.Set("Accept-Encoding", "gzip")
+
+	log.Debug().
+		Str("metric_id", metric.ID).
+		Int("original_size", len(body)).
+		Int("compressed_size", buf.Len()).
+		Interface("headers", req.Header).
+		Msg("sending outgoing agent request")
+
 	resp, err := client.Do(req)
 	if err != nil {
-		fmt.Printf("Error sending metric %s: %v\n", name, err)
+		log.Error().
+			Err(err).
+			Str("metric", metric.ID).
+			Msg("failed to send metric")
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		fmt.Printf("Unexpected status code for %s: %d\n", name, resp.StatusCode)
+		log.Warn().
+			Int("status_code", resp.StatusCode).
+			Str("metric", metric.ID).
+			Msg("unexpected response status")
 	}
 }
