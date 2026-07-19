@@ -7,11 +7,11 @@ import (
 func TestNewMemStorage(t *testing.T) {
 	storage := NewMemStorage()
 
-	if storage.Gauge == nil {
+	if storage.gauge == nil {
 		t.Error("Gauge map must be init")
 	}
 
-	if storage.Counter == nil {
+	if storage.counter == nil {
 		t.Error("Counter map must be init")
 	}
 }

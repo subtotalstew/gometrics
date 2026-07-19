@@ -72,7 +72,9 @@ func main() {
 
 	h := handler.NewHandler(memstorage)
 
-	// Если storeInterval == 0, сохраняем синхронно после каждого успешного изменения.
+	var stop chan struct{}
+	var done chan struct{}
+
 	if filePath != "" {
 		if storeInterval == 0 {
 			h.SetSyncSave(func() {
@@ -81,9 +83,12 @@ func main() {
 				}
 			})
 		} else {
-			stop := make(chan struct{})
-			go storage.RunPeriodicSave(memstorage, filePath, storeInterval, stop)
-			defer close(stop)
+			stop = make(chan struct{})
+			done = make(chan struct{})
+			go func() {
+				defer close(done)
+				storage.RunPeriodicSave(memstorage, filePath, storeInterval, stop)
+			}()
 		}
 	}
 
@@ -115,10 +120,17 @@ func main() {
 	<-sigChan
 
 	log.Info().Msg("shutting down, saving metrics before exit")
+
+	if stop != nil {
+		close(stop)
+		<-done
+	}
+
 	if filePath != "" {
 		if err := storage.SaveToFile(memstorage, filePath); err != nil {
 			log.Error().Err(err).Msg("не удалось сохранить метрики при завершении работы")
 		}
 	}
+
 	_ = srv.Close()
 }
