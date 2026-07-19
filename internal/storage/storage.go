@@ -54,6 +54,14 @@ func (m *MemStorage) GetAllMetrics() (map[string]float64, map[string]int64) {
 		copyGauge[k] = v
 	}
 	for k, v := range m.counter {
+	copyGauge := make(map[string]float64, len(m.Gauge))
+	copyCounter := make(map[string]int64, len(m.Counter))
+
+	for k, v := range m.Gauge {
+		copyGauge[k] = v
+	}
+
+	for k, v := range m.Counter {
 		copyCounter[k] = v
 	}
 
