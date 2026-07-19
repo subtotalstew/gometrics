@@ -1,6 +1,9 @@
 package storage
 
-import "sync"
+import (
+	"maps"
+	"sync"
+)
 
 type MemStorage struct {
 	mu      sync.RWMutex
@@ -47,25 +50,7 @@ func (m *MemStorage) GetAllMetrics() (map[string]float64, map[string]int64) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	copyGauge := make(map[string]float64, len(m.gauge))
-	copyCounter := make(map[string]int64, len(m.counter))
-
-	for k, v := range m.gauge {
-		copyGauge[k] = v
-	}
-	for k, v := range m.counter {
-	copyGauge := make(map[string]float64, len(m.Gauge))
-	copyCounter := make(map[string]int64, len(m.Counter))
-
-	for k, v := range m.Gauge {
-		copyGauge[k] = v
-	}
-
-	for k, v := range m.Counter {
-		copyCounter[k] = v
-	}
-
-	return copyGauge, copyCounter
+	return maps.Clone(m.gauge), maps.Clone(m.counter)
 }
 
 type Storage interface {
