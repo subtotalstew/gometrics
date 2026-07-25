@@ -418,3 +418,16 @@ func TestGzipMiddleware_CompressJSONResponse(t *testing.T) {
 	assert.Equal(t, http.StatusOK, res.StatusCode)
 	assert.Equal(t, "gzip", res.Header.Get("Content-Encoding"))
 }
+
+func TestPingHandler_NoDB(t *testing.T) {
+	h := handler.NewHandler(storage.NewMemStorage())
+
+	req := httptest.NewRequest(http.MethodGet, "/ping", nil)
+	w := httptest.NewRecorder()
+
+	h.PingHandler(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("PingHandler() status = %d, want %d", w.Code, http.StatusInternalServerError)
+	}
+}

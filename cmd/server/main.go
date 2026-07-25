@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"flag"
 	"net/http"
 	"os"
@@ -22,12 +23,14 @@ func main() {
 		storeInterval int
 		filePath      string
 		restore       bool
+		databaseDSN   string
 	)
 
 	flag.StringVar(&addr, "a", "localhost:8080", "address and port to run server, format: <hostname>:<port>")
 	flag.IntVar(&storeInterval, "i", 300, "interval in seconds to persist metrics to disk (0 = synchronous save)")
 	flag.StringVar(&filePath, "f", "metrics-store.json", "path to file for persisting metrics")
 	flag.BoolVar(&restore, "r", true, "whether to restore previously saved metrics on start")
+	flag.StringVar(&databaseDSN, "d", "", "database connection string")
 
 	flag.Parse()
 
@@ -55,11 +58,16 @@ func main() {
 		restore = val
 	}
 
+	if envDSN := os.Getenv("DATABASE_DSN"); envDSN != "" {
+		databaseDSN = envDSN
+	}
+
 	log.Info().Msgf("Starting server on %s", addr)
 	log.Info().
 		Int("store_interval", storeInterval).
 		Str("file_storage_path", filePath).
 		Bool("restore", restore).
+		Bool("database_configured", databaseDSN != "").
 		Msg("persistence configuration")
 
 	memstorage := storage.NewMemStorage()
@@ -71,6 +79,17 @@ func main() {
 	}
 
 	h := handler.NewHandler(memstorage)
+
+	var db *sql.DB
+	if databaseDSN != "" {
+		var err error
+		db, err = sql.Open("postgres", databaseDSN)
+		if err != nil {
+			log.Error().Err(err).Msg("не удалось установить соединение с БД")
+		} else {
+			h.SetDB(db)
+		}
+	}
 
 	var stop chan struct{}
 	var done chan struct{}
@@ -106,6 +125,7 @@ func main() {
 	r.Post("/update/{type}/{name}/{value}", h.UpdateHandler)
 	r.Get("/value/{type}/{name}", h.ValueHandler)
 	r.Get("/", h.RootHandler)
+	r.Get("/ping", h.PingHandler)
 
 	srv := &http.Server{Addr: addr, Handler: r}
 

@@ -3,6 +3,8 @@ package handler
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -20,6 +22,7 @@ import (
 type Handler struct {
 	storage  storage.Storage
 	syncSave func()
+	db       *sql.DB
 }
 
 func NewHandler(storage storage.Storage) *Handler {
@@ -35,6 +38,27 @@ func (h *Handler) trySyncSave() {
 		h.syncSave()
 	}
 }
+
+func (h *Handler) SetDB(db *sql.DB) {
+	h.db = db
+}
+
+func (h *Handler) PingHandler(w http.ResponseWriter, r *http.Request) {
+	if h.db == nil {
+		http.Error(w, "database not configured", http.StatusInternalServerError)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+
+	if err := h.db.PingContext(ctx); err != nil {
+		http.Error(w, "database ping error", http.StatusInternalServerError)
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
 func (h *Handler) UpdateHandler(w http.ResponseWriter, r *http.Request) {
 
 	metricType := chi.URLParam(r, "type")
