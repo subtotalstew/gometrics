@@ -16,6 +16,7 @@ import (
 
 	"github.com/rs/zerolog/log"
 	models "github.com/subtotalstew/gometrics.git/internal/model"
+	"github.com/subtotalstew/gometrics.git/internal/retry"
 )
 
 type Collector struct {
@@ -171,16 +172,14 @@ func (a *Agent) sendMetricsBatch(client *http.Client) {
 		return
 	}
 
-	url := fmt.Sprintf("%s/updates/", a.serverAddr)
-
 	body, err := json.Marshal(metrics)
 	if err != nil {
 		log.Error().Err(err).Int("count", len(metrics)).Msg("failed to marshal metrics batch")
 		return
 	}
 
-	var buf bytes.Buffer
-	gz := gzip.NewWriter(&buf)
+	var compressed bytes.Buffer
+	gz := gzip.NewWriter(&compressed)
 	if _, err := gz.Write(body); err != nil {
 		log.Error().Err(err).Msg("failed to write gzip body")
 		return
@@ -189,36 +188,47 @@ func (a *Agent) sendMetricsBatch(client *http.Client) {
 		log.Error().Err(err).Msg("failed to close gzip writer")
 		return
 	}
+	compressedBytes := compressed.Bytes()
 
-	req, err := http.NewRequest(http.MethodPost, url, &buf)
-	if err != nil {
-		log.Error().Err(err).Msg("failed to create batch request")
-		return
+	url := fmt.Sprintf("%s/updates/", a.serverAddr)
+
+	sendOnce := func() error {
+		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(compressedBytes))
+		if err != nil {
+			return err
+		}
+
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Content-Encoding", "gzip")
+		req.Header.Set("Accept-Encoding", "gzip")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+
+		if isRetriableStatus(resp.StatusCode) {
+			return fmt.Errorf("server returned retriable status %d", resp.StatusCode)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			log.Warn().
+				Int("status_code", resp.StatusCode).
+				Int("count", len(metrics)).
+				Msg("unexpected response status for batch")
+			return nil
+		}
+
+		return nil
 	}
 
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Content-Encoding", "gzip")
-	req.Header.Set("Accept-Encoding", "gzip")
+	err = retry.Do("send_metrics_batch", sendOnce, func(err error) bool {
+		return isRetriableHTTPError(err)
+	})
 
-	log.Debug().
-		Int("metrics_count", len(metrics)).
-		Int("original_size", len(body)).
-		Int("compressed_size", buf.Len()).
-		Interface("headers", req.Header).
-		Msg("sending batch request")
-
-	resp, err := client.Do(req)
 	if err != nil {
-		log.Error().Err(err).Int("count", len(metrics)).Msg("failed to send metrics batch")
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		log.Warn().
-			Int("status_code", resp.StatusCode).
-			Int("count", len(metrics)).
-			Msg("unexpected response status for batch")
+		log.Error().Err(err).Int("count", len(metrics)).Msg("failed to send metrics batch after retries")
 		return
 	}
 

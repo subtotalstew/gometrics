@@ -2,13 +2,17 @@ package storage
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 
 	"github.com/golang-migrate/migrate/v4"
 	"github.com/golang-migrate/migrate/v4/database/postgres"
 	_ "github.com/golang-migrate/migrate/v4/source/file"
+	"github.com/jackc/pgconn"
+	"github.com/jackc/pgerrcode"
 	"github.com/rs/zerolog/log"
 	models "github.com/subtotalstew/gometrics.git/internal/model"
+	"github.com/subtotalstew/gometrics.git/internal/retry"
 )
 
 type DBStorage struct {
@@ -78,32 +82,40 @@ func (s *DBStorage) Close() error {
 }
 
 func (s *DBStorage) SetGauge(name string, value float64) error {
-	_, err := s.db.Exec(`
-		INSERT INTO gauges (id, value)
-		VALUES ($1, $2)
-		ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value
-	`, name, value)
-	if err != nil {
-		log.Error().Err(err).Str("metric", name).Msg("не удалось сохранить gauge в БД")
-	}
-	return err
+	return retry.Do("db_set_gauge", func() error {
+		_, err := s.db.Exec(`
+			INSERT INTO gauges (id, value)
+			VALUES ($1, $2)
+			ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value
+		`, name, value)
+		if err != nil {
+			log.Error().Err(err).Str("metric", name).Msg("не удалось сохранить gauge в БД")
+		}
+		return err
+	}, isRetriablePgError)
 }
 
 func (s *DBStorage) UpdateCounter(name string, value int64) error {
-	_, err := s.db.Exec(`
-		INSERT INTO counters (id, delta)
-		VALUES ($1, $2)
-		ON CONFLICT (id) DO UPDATE SET delta = counters.delta + EXCLUDED.delta
-	`, name, value)
-	if err != nil {
-		log.Error().Err(err).Str("metric", name).Msg("не удалось обновить counter в БД")
-	}
-	return err
+	return retry.Do("db_update_counter", func() error {
+		_, err := s.db.Exec(`
+			INSERT INTO counters (id, delta)
+			VALUES ($1, $2)
+			ON CONFLICT (id) DO UPDATE SET delta = counters.delta + EXCLUDED.delta
+		`, name, value)
+		if err != nil {
+			log.Error().Err(err).Str("metric", name).Msg("не удалось обновить counter в БД")
+		}
+		return err
+	}, isRetriablePgError)
 }
 
 func (s *DBStorage) GetGauge(name string) (float64, bool) {
 	var value float64
-	err := s.db.QueryRow(`SELECT value FROM gauges WHERE id = $1`, name).Scan(&value)
+
+	err := retry.Do("db_get_gauge", func() error {
+		return s.db.QueryRow(`SELECT value FROM gauges WHERE id = $1`, name).Scan(&value)
+	}, isRetriablePgError)
+
 	if err != nil {
 		if err != sql.ErrNoRows {
 			log.Error().Err(err).Str("metric", name).Msg("не удалось получить gauge из БД")
@@ -115,7 +127,11 @@ func (s *DBStorage) GetGauge(name string) (float64, bool) {
 
 func (s *DBStorage) GetCounter(name string) (int64, bool) {
 	var delta int64
-	err := s.db.QueryRow(`SELECT delta FROM counters WHERE id = $1`, name).Scan(&delta)
+
+	err := retry.Do("db_get_counter", func() error {
+		return s.db.QueryRow(`SELECT delta FROM counters WHERE id = $1`, name).Scan(&delta)
+	}, isRetriablePgError)
+
 	if err != nil {
 		if err != sql.ErrNoRows {
 			log.Error().Err(err).Str("metric", name).Msg("не удалось получить counter из БД")
@@ -175,61 +191,71 @@ func (s *DBStorage) UpdateBatch(metrics []models.Metrics) error {
 		return nil
 	}
 
-	tx, err := s.db.Begin()
-	if err != nil {
-		log.Error().Err(err).Msg("не удалось начать транзакцию batch-обновления")
-		return err
-	}
-	defer tx.Rollback()
+	return retry.Do("db_update_batch", func() error {
+		tx, err := s.db.Begin()
+		if err != nil {
+			log.Error().Err(err).Msg("не удалось начать транзакцию для batch-обновления")
+			return err
+		}
+		defer tx.Rollback() //nolint:errcheck
 
-	gaugeStmt, err := tx.Prepare(`
-	INSERT INTO gauges (id, value)
-	VALUES ($1, $2)
-	ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value
-	`)
-	if err != nil {
-		log.Error().Err(err).Msg("не удалось подготовить statement для gauges")
-		return err
-	}
-	defer gaugeStmt.Close()
+		gaugeStmt, err := tx.Prepare(`
+			INSERT INTO gauges (id, value)
+			VALUES ($1, $2)
+			ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value
+		`)
+		if err != nil {
+			return err
+		}
+		defer gaugeStmt.Close()
 
-	counterStmt, err := tx.Prepare(`
-		INSERT INTO counters (id, delta)
-		VALUES ($1, $2)
-		ON CONFLICT (id) DO UPDATE SET delta = counters.delta + EXCLUDED.delta
-	`)
-	if err != nil {
-		log.Error().Err(err).Msg("не удалось подготовить statement для counters")
-		return err
-	}
-	defer counterStmt.Close()
+		counterStmt, err := tx.Prepare(`
+			INSERT INTO counters (id, delta)
+			VALUES ($1, $2)
+			ON CONFLICT (id) DO UPDATE SET delta = counters.delta + EXCLUDED.delta
+		`)
+		if err != nil {
+			return err
+		}
+		defer counterStmt.Close()
 
-	for _, mt := range metrics {
-		switch mt.MType {
-		case models.Gauge:
-			if mt.Value == nil {
-				continue
-			}
-			if _, err := gaugeStmt.Exec(mt.ID, *mt.Value); err != nil {
-				log.Error().Err(err).Str("metric", mt.ID).Msg("не удалось записать gauge в batch")
-				return err
-			}
-		case models.Counter:
-			if mt.Delta == nil {
-				continue
-			}
-			if _, err := counterStmt.Exec(mt.ID, *mt.Delta); err != nil {
-				log.Error().Err(err).Str("metric", mt.ID).Msg("не удалось записать counter в batch")
-				return err
+		for _, mt := range metrics {
+			switch mt.MType {
+			case models.Gauge:
+				if mt.Value == nil {
+					continue
+				}
+				if _, err := gaugeStmt.Exec(mt.ID, *mt.Value); err != nil {
+					return err
+				}
+			case models.Counter:
+				if mt.Delta == nil {
+					continue
+				}
+				if _, err := counterStmt.Exec(mt.ID, *mt.Delta); err != nil {
+					return err
+				}
 			}
 		}
+
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+
+		log.Debug().Int("count", len(metrics)).Msg("batch метрик записан в БД")
+		return nil
+	}, isRetriablePgError)
+}
+
+func isRetriablePgError(err error) bool {
+	if err == nil {
+		return false
 	}
 
-	if err := tx.Commit(); err != nil {
-		log.Error().Err(err).Msg("не удалось закоммитить транзакцию batch-обновления")
-		return err
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return len(pgErr.Code) >= 2 && pgErr.Code[:2] == pgerrcode.ConnectionException[:2]
 	}
 
-	log.Debug().Int("count", len(metrics)).Msg("batch метрик записан в БД")
-	return nil
+	return false
 }
