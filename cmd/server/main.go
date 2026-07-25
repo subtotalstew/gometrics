@@ -1,7 +1,6 @@
 package main
 
 import (
-	"database/sql"
 	"flag"
 	"net/http"
 	"os"
@@ -38,7 +37,6 @@ func main() {
 	if envAddr := os.Getenv("ADDRESS"); envAddr != "" {
 		addr = envAddr
 	}
-
 	if envInterval := os.Getenv("STORE_INTERVAL"); envInterval != "" {
 		val, err := strconv.Atoi(envInterval)
 		if err != nil {
@@ -46,11 +44,9 @@ func main() {
 		}
 		storeInterval = val
 	}
-
 	if envFile := os.Getenv("FILE_STORAGE_PATH"); envFile != "" {
 		filePath = envFile
 	}
-
 	if envRestore := os.Getenv("RESTORE"); envRestore != "" {
 		val, err := strconv.ParseBool(envRestore)
 		if err != nil {
@@ -58,57 +54,68 @@ func main() {
 		}
 		restore = val
 	}
-
 	if envDSN := os.Getenv("DATABASE_DSN"); envDSN != "" {
 		databaseDSN = envDSN
 	}
 
 	log.Info().Msgf("Starting server on %s", addr)
-	log.Info().
-		Int("store_interval", storeInterval).
-		Str("file_storage_path", filePath).
-		Bool("restore", restore).
-		Bool("database_configured", databaseDSN != "").
-		Msg("persistence configuration")
 
-	memstorage := storage.NewMemStorage()
+	var (
+		metricsStorage storage.Storage
+		dbStorage      *storage.DBStorage
+	)
 
-	if restore && filePath != "" {
-		if err := storage.LoadFromFile(memstorage, filePath); err != nil {
-			log.Error().Err(err).Msg("не удалось восстановить метрики из файла")
+	switch {
+	case databaseDSN != "":
+		var err error
+		dbStorage, err = storage.NewDBStorage(databaseDSN, "migrations")
+		if err != nil {
+			log.Fatal().Err(err).Msg("не удалось инициализировать хранилище PostgreSQL")
+		}
+		metricsStorage = dbStorage
+		log.Info().Msg("используется хранилище: PostgreSQL")
+
+	default:
+		mem := storage.NewMemStorage()
+		metricsStorage = mem
+
+		if filePath != "" {
+			log.Info().Msg("используется хранилище: файл (с бэкапом в память)")
+			if restore {
+				if err := storage.LoadFromFile(mem, filePath); err != nil {
+					log.Error().Err(err).Msg("не удалось восстановить метрики из файла")
+				}
+			}
+		} else {
+			log.Info().Msg("используется хранилище: память")
 		}
 	}
 
-	h := handler.NewHandler(memstorage)
+	h := handler.NewHandler(metricsStorage)
 
-	var db *sql.DB
-	if databaseDSN != "" {
-		var err error
-		db, err = sql.Open("postgres", databaseDSN)
-		if err != nil {
-			log.Error().Err(err).Msg("не удалось установить соединение с БД")
-		} else {
-			h.SetDB(db)
-		}
+	if dbStorage != nil {
+		h.SetDB(dbStorage.DB())
 	}
 
 	var stop chan struct{}
 	var done chan struct{}
 
-	if filePath != "" {
-		if storeInterval == 0 {
-			h.SetSyncSave(func() {
-				if err := storage.SaveToFile(memstorage, filePath); err != nil {
-					log.Error().Err(err).Msg("не удалось синхронно сохранить метрики")
-				}
-			})
-		} else {
-			stop = make(chan struct{})
-			done = make(chan struct{})
-			go func() {
-				defer close(done)
-				storage.RunPeriodicSave(memstorage, filePath, storeInterval, stop)
-			}()
+	if databaseDSN == "" && filePath != "" {
+		if memStorage, ok := metricsStorage.(*storage.MemStorage); ok {
+			if storeInterval == 0 {
+				h.SetSyncSave(func() {
+					if err := storage.SaveToFile(memStorage, filePath); err != nil {
+						log.Error().Err(err).Msg("не удалось синхронно сохранить метрики")
+					}
+				})
+			} else {
+				stop = make(chan struct{})
+				done = make(chan struct{})
+				go func() {
+					defer close(done)
+					storage.RunPeriodicSave(memStorage, filePath, storeInterval, stop)
+				}()
+			}
 		}
 	}
 
@@ -140,17 +147,23 @@ func main() {
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	<-sigChan
 
-	log.Info().Msg("shutting down, saving metrics before exit")
+	log.Info().Msg("shutting down")
 
 	if stop != nil {
 		close(stop)
 		<-done
 	}
 
-	if filePath != "" {
-		if err := storage.SaveToFile(memstorage, filePath); err != nil {
-			log.Error().Err(err).Msg("не удалось сохранить метрики при завершении работы")
+	if databaseDSN == "" && filePath != "" {
+		if memStorage, ok := metricsStorage.(*storage.MemStorage); ok {
+			if err := storage.SaveToFile(memStorage, filePath); err != nil {
+				log.Error().Err(err).Msg("не удалось сохранить метрики при завершении работы")
+			}
 		}
+	}
+
+	if dbStorage != nil {
+		_ = dbStorage.Close()
 	}
 
 	_ = srv.Close()
