@@ -135,6 +135,9 @@ func main() {
 	r.Get("/", h.RootHandler)
 	r.Get("/ping", h.PingHandler)
 
+	r.Post("/updates", h.UpdatesJSONHandler)
+	r.Post("/updates/", h.UpdatesJSONHandler)
+
 	srv := &http.Server{Addr: addr, Handler: r}
 
 	go func() {

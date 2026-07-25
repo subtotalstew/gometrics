@@ -8,6 +8,7 @@ import (
 	"github.com/golang-migrate/migrate/v4/database/postgres"
 	_ "github.com/golang-migrate/migrate/v4/source/file"
 	"github.com/rs/zerolog/log"
+	models "github.com/subtotalstew/gometrics.git/internal/model"
 )
 
 type DBStorage struct {
@@ -167,4 +168,68 @@ func (s *DBStorage) GetAllMetrics() (map[string]float64, map[string]int64) {
 	}
 
 	return gauges, counters
+}
+
+func (s *DBStorage) UpdateBatch(metrics []models.Metrics) error {
+	if len(metrics) == 0 {
+		return nil
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		log.Error().Err(err).Msg("не удалось начать транзакцию batch-обновления")
+		return err
+	}
+	defer tx.Rollback()
+
+	gaugeStmt, err := tx.Prepare(`
+	INSERT INTO gauges (id, value)
+	VALUES ($1, $2)
+	ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value
+	`)
+	if err != nil {
+		log.Error().Err(err).Msg("не удалось подготовить statement для gauges")
+		return err
+	}
+	defer gaugeStmt.Close()
+
+	counterStmt, err := tx.Prepare(`
+		INSERT INTO counters (id, delta)
+		VALUES ($1, $2)
+		ON CONFLICT (id) DO UPDATE SET delta = counters.delta + EXCLUDED.delta
+	`)
+	if err != nil {
+		log.Error().Err(err).Msg("не удалось подготовить statement для counters")
+		return err
+	}
+	defer counterStmt.Close()
+
+	for _, mt := range metrics {
+		switch mt.MType {
+		case models.Gauge:
+			if mt.Value == nil {
+				continue
+			}
+			if _, err := gaugeStmt.Exec(mt.ID, *mt.Value); err != nil {
+				log.Error().Err(err).Str("metric", mt.ID).Msg("не удалось записать gauge в batch")
+				return err
+			}
+		case models.Counter:
+			if mt.Delta == nil {
+				continue
+			}
+			if _, err := counterStmt.Exec(mt.ID, *mt.Delta); err != nil {
+				log.Error().Err(err).Str("metric", mt.ID).Msg("не удалось записать counter в batch")
+				return err
+			}
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		log.Error().Err(err).Msg("не удалось закоммитить транзакцию batch-обновления")
+		return err
+	}
+
+	log.Debug().Int("count", len(metrics)).Msg("batch метрик записан в БД")
+	return nil
 }

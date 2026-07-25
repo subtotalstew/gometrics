@@ -3,6 +3,8 @@ package storage
 import (
 	"maps"
 	"sync"
+
+	models "github.com/subtotalstew/gometrics.git/internal/model"
 )
 
 type MemStorage struct {
@@ -53,10 +55,30 @@ func (m *MemStorage) GetAllMetrics() (map[string]float64, map[string]int64) {
 	return maps.Clone(m.gauge), maps.Clone(m.counter)
 }
 
+func (m *MemStorage) UpdateBatch(metrics []models.Metrics) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, mt := range metrics {
+		switch mt.MType {
+		case models.Gauge:
+			if mt.Value != nil {
+				m.gauge[mt.ID] = *mt.Value
+			}
+		case models.Counter:
+			if mt.Delta != nil {
+				m.counter[mt.ID] += *mt.Delta
+			}
+		}
+	}
+	return nil
+}
+
 type Storage interface {
 	SetGauge(name string, value float64) error
 	UpdateCounter(name string, value int64) error
 	GetCounter(name string) (int64, bool)
 	GetGauge(name string) (float64, bool)
 	GetAllMetrics() (map[string]float64, map[string]int64)
+	UpdateBatch(metrics []models.Metrics) error
 }

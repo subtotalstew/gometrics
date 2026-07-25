@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"sync"
 	"syscall"
 	"time"
 
@@ -81,6 +82,7 @@ func (c *Collector) GetCounter() map[string]int64 {
 }
 
 type Agent struct {
+	mu             sync.RWMutex
 	collector      *Collector
 	serverAddr     string
 	pollInterval   int
@@ -137,26 +139,90 @@ func (a *Agent) Run() {
 
 func (a *Agent) sendMetrics() {
 	client := &http.Client{Timeout: 5 * time.Second}
+	a.sendMetricsBatch(client)
+}
 
-	for name, value := range a.collector.GetGauge() {
+func (a *Agent) sendMetricsBatch(client *http.Client) {
+	gauges := a.collector.GetGauge()
+	counters := a.collector.GetCounter()
+
+	metrics := make([]models.Metrics, 0, len(gauges)+len(counters))
+
+	for name, value := range gauges {
 		valCopy := value
-		m := models.Metrics{
+		metrics = append(metrics, models.Metrics{
 			ID:    name,
 			MType: models.Gauge,
 			Value: &valCopy,
-		}
-		a.sendMetricJSON(client, m)
+		})
 	}
 
-	for name, value := range a.collector.GetCounter() {
+	for name, value := range counters {
 		deltaCopy := value
-		m := models.Metrics{
+		metrics = append(metrics, models.Metrics{
 			ID:    name,
 			MType: models.Counter,
 			Delta: &deltaCopy,
-		}
-		a.sendMetricJSON(client, m)
+		})
 	}
+
+	if len(metrics) == 0 {
+		log.Debug().Msg("нет метрик для отправки, батч пропущен")
+		return
+	}
+
+	url := fmt.Sprintf("%s/updates/", a.serverAddr)
+
+	body, err := json.Marshal(metrics)
+	if err != nil {
+		log.Error().Err(err).Int("count", len(metrics)).Msg("failed to marshal metrics batch")
+		return
+	}
+
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	if _, err := gz.Write(body); err != nil {
+		log.Error().Err(err).Msg("failed to write gzip body")
+		return
+	}
+	if err := gz.Close(); err != nil {
+		log.Error().Err(err).Msg("failed to close gzip writer")
+		return
+	}
+
+	req, err := http.NewRequest(http.MethodPost, url, &buf)
+	if err != nil {
+		log.Error().Err(err).Msg("failed to create batch request")
+		return
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Encoding", "gzip")
+	req.Header.Set("Accept-Encoding", "gzip")
+
+	log.Debug().
+		Int("metrics_count", len(metrics)).
+		Int("original_size", len(body)).
+		Int("compressed_size", buf.Len()).
+		Interface("headers", req.Header).
+		Msg("sending batch request")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Error().Err(err).Int("count", len(metrics)).Msg("failed to send metrics batch")
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Warn().
+			Int("status_code", resp.StatusCode).
+			Int("count", len(metrics)).
+			Msg("unexpected response status for batch")
+		return
+	}
+
+	log.Info().Int("count", len(metrics)).Msg("metrics batch sent successfully")
 }
 
 func (a *Agent) sendMetricJSON(client *http.Client, metric models.Metrics) {
