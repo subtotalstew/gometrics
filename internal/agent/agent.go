@@ -213,10 +213,6 @@ func (a *Agent) sendMetricsBatch(client *http.Client) {
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			log.Warn().
-				Int("status_code", resp.StatusCode).
-				Int("count", len(metrics)).
-				Msg("unexpected response status for batch")
 			return nil
 		}
 

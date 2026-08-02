@@ -88,9 +88,6 @@ func (s *DBStorage) SetGauge(name string, value float64) error {
 			VALUES ($1, $2)
 			ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value
 		`, name, value)
-		if err != nil {
-			log.Error().Err(err).Str("metric", name).Msg("не удалось сохранить gauge в БД")
-		}
 		return err
 	}, isRetriablePgError)
 }
@@ -102,9 +99,6 @@ func (s *DBStorage) UpdateCounter(name string, value int64) error {
 			VALUES ($1, $2)
 			ON CONFLICT (id) DO UPDATE SET delta = counters.delta + EXCLUDED.delta
 		`, name, value)
-		if err != nil {
-			log.Error().Err(err).Str("metric", name).Msg("не удалось обновить counter в БД")
-		}
 		return err
 	}, isRetriablePgError)
 }
@@ -117,9 +111,6 @@ func (s *DBStorage) GetGauge(name string) (float64, bool) {
 	}, isRetriablePgError)
 
 	if err != nil {
-		if err != sql.ErrNoRows {
-			log.Error().Err(err).Str("metric", name).Msg("не удалось получить gauge из БД")
-		}
 		return 0, false
 	}
 	return value, true
@@ -133,9 +124,6 @@ func (s *DBStorage) GetCounter(name string) (int64, bool) {
 	}, isRetriablePgError)
 
 	if err != nil {
-		if err != sql.ErrNoRows {
-			log.Error().Err(err).Str("metric", name).Msg("не удалось получить counter из БД")
-		}
 		return 0, false
 	}
 	return delta, true

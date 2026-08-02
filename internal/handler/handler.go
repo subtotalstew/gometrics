@@ -54,6 +54,7 @@ func (h *Handler) PingHandler(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.db.PingContext(ctx); err != nil {
 		http.Error(w, "database ping error", http.StatusInternalServerError)
+		return
 	}
 
 	w.WriteHeader(http.StatusOK)
