@@ -10,6 +10,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	_ "github.com/lib/pq"
 	"github.com/rs/zerolog/log"
 	"github.com/subtotalstew/gometrics.git/internal/handler"
 	"github.com/subtotalstew/gometrics.git/internal/storage"
@@ -22,19 +23,20 @@ func main() {
 		storeInterval int
 		filePath      string
 		restore       bool
+		databaseDSN   string
 	)
 
 	flag.StringVar(&addr, "a", "localhost:8080", "address and port to run server, format: <hostname>:<port>")
 	flag.IntVar(&storeInterval, "i", 300, "interval in seconds to persist metrics to disk (0 = synchronous save)")
 	flag.StringVar(&filePath, "f", "metrics-store.json", "path to file for persisting metrics")
 	flag.BoolVar(&restore, "r", true, "whether to restore previously saved metrics on start")
+	flag.StringVar(&databaseDSN, "d", "", "database connection string")
 
 	flag.Parse()
 
 	if envAddr := os.Getenv("ADDRESS"); envAddr != "" {
 		addr = envAddr
 	}
-
 	if envInterval := os.Getenv("STORE_INTERVAL"); envInterval != "" {
 		val, err := strconv.Atoi(envInterval)
 		if err != nil {
@@ -42,11 +44,9 @@ func main() {
 		}
 		storeInterval = val
 	}
-
 	if envFile := os.Getenv("FILE_STORAGE_PATH"); envFile != "" {
 		filePath = envFile
 	}
-
 	if envRestore := os.Getenv("RESTORE"); envRestore != "" {
 		val, err := strconv.ParseBool(envRestore)
 		if err != nil {
@@ -54,41 +54,68 @@ func main() {
 		}
 		restore = val
 	}
+	if envDSN := os.Getenv("DATABASE_DSN"); envDSN != "" {
+		databaseDSN = envDSN
+	}
 
 	log.Info().Msgf("Starting server on %s", addr)
-	log.Info().
-		Int("store_interval", storeInterval).
-		Str("file_storage_path", filePath).
-		Bool("restore", restore).
-		Msg("persistence configuration")
 
-	memstorage := storage.NewMemStorage()
+	var (
+		metricsStorage storage.Storage
+		dbStorage      *storage.DBStorage
+	)
 
-	if restore && filePath != "" {
-		if err := storage.LoadFromFile(memstorage, filePath); err != nil {
-			log.Error().Err(err).Msg("не удалось восстановить метрики из файла")
+	switch {
+	case databaseDSN != "":
+		var err error
+		dbStorage, err = storage.NewDBStorage(databaseDSN, "migrations")
+		if err != nil {
+			log.Fatal().Err(err).Msg("не удалось инициализировать хранилище PostgreSQL")
+		}
+		metricsStorage = dbStorage
+		log.Info().Msg("используется хранилище: PostgreSQL")
+
+	default:
+		mem := storage.NewMemStorage()
+		metricsStorage = mem
+
+		if filePath != "" {
+			log.Info().Msg("используется хранилище: файл (с бэкапом в память)")
+			if restore {
+				if err := storage.LoadFromFile(mem, filePath); err != nil {
+					log.Error().Err(err).Msg("не удалось восстановить метрики из файла")
+				}
+			}
+		} else {
+			log.Info().Msg("используется хранилище: память")
 		}
 	}
 
-	h := handler.NewHandler(memstorage)
+	h := handler.NewHandler(metricsStorage)
+
+	if dbStorage != nil {
+		h.SetDB(dbStorage.DB())
+	}
 
 	var stop chan struct{}
 	var done chan struct{}
 
-	if filePath != "" {
-		if storeInterval == 0 {
-			h.SetSyncSave(func() {
-				if err := storage.SaveToFile(memstorage, filePath); err != nil {
-					log.Error().Err(err).Msg("не удалось синхронно сохранить метрики")
-				}
-			})
-		} else {
-			stop = make(chan struct{})
-			done = make(chan struct{})
-			go func() {
-				defer close(done)
-				storage.RunPeriodicSave(memstorage, filePath, storeInterval, stop)
-			}()
+	if databaseDSN == "" && filePath != "" {
+		if memStorage, ok := metricsStorage.(*storage.MemStorage); ok {
+			if storeInterval == 0 {
+				h.SetSyncSave(func() {
+					if err := storage.SaveToFile(memStorage, filePath); err != nil {
+						log.Error().Err(err).Msg("не удалось синхронно сохранить метрики")
+					}
+				})
+			} else {
+				stop = make(chan struct{})
+				done = make(chan struct{})
+				go func() {
+					defer close(done)
+					storage.RunPeriodicSave(memStorage, filePath, storeInterval, stop)
+				}()
+			}
 		}
 	}
 
@@ -106,6 +133,10 @@ func main() {
 	r.Post("/update/{type}/{name}/{value}", h.UpdateHandler)
 	r.Get("/value/{type}/{name}", h.ValueHandler)
 	r.Get("/", h.RootHandler)
+	r.Get("/ping", h.PingHandler)
+
+	r.Post("/updates", h.UpdatesJSONHandler)
+	r.Post("/updates/", h.UpdatesJSONHandler)
 
 	srv := &http.Server{Addr: addr, Handler: r}
 
@@ -119,17 +150,23 @@ func main() {
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	<-sigChan
 
-	log.Info().Msg("shutting down, saving metrics before exit")
+	log.Info().Msg("shutting down")
 
 	if stop != nil {
 		close(stop)
 		<-done
 	}
 
-	if filePath != "" {
-		if err := storage.SaveToFile(memstorage, filePath); err != nil {
-			log.Error().Err(err).Msg("не удалось сохранить метрики при завершении работы")
+	if databaseDSN == "" && filePath != "" {
+		if memStorage, ok := metricsStorage.(*storage.MemStorage); ok {
+			if err := storage.SaveToFile(memStorage, filePath); err != nil {
+				log.Error().Err(err).Msg("не удалось сохранить метрики при завершении работы")
+			}
 		}
+	}
+
+	if dbStorage != nil {
+		_ = dbStorage.Close()
 	}
 
 	_ = srv.Close()

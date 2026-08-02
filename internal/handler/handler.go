@@ -3,6 +3,8 @@ package handler
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -20,6 +22,7 @@ import (
 type Handler struct {
 	storage  storage.Storage
 	syncSave func()
+	db       *sql.DB
 }
 
 func NewHandler(storage storage.Storage) *Handler {
@@ -35,6 +38,28 @@ func (h *Handler) trySyncSave() {
 		h.syncSave()
 	}
 }
+
+func (h *Handler) SetDB(db *sql.DB) {
+	h.db = db
+}
+
+func (h *Handler) PingHandler(w http.ResponseWriter, r *http.Request) {
+	if h.db == nil {
+		http.Error(w, "database not configured", http.StatusInternalServerError)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+
+	if err := h.db.PingContext(ctx); err != nil {
+		http.Error(w, "database ping error", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
 func (h *Handler) UpdateHandler(w http.ResponseWriter, r *http.Request) {
 
 	metricType := chi.URLParam(r, "type")
@@ -398,4 +423,41 @@ func (ctw *contentTypeCheckWriter) WriteHeader(statusCode int) {
 		ctw.rawWriter.Header().Set("Content-Encoding", "gzip")
 	}
 	ctw.ResponseWriter.WriteHeader(statusCode)
+}
+
+func (h *Handler) UpdatesJSONHandler(w http.ResponseWriter, r *http.Request) {
+	var metrics []models.Metrics
+
+	if err := json.NewDecoder(r.Body).Decode(&metrics); err != nil {
+		http.Error(w, "JSON invalid", http.StatusBadRequest)
+		return
+	}
+
+	if len(metrics) == 0 {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	for _, m := range metrics {
+		if m.MType != models.Gauge && m.MType != models.Counter {
+			http.Error(w, "invalid metric type: "+m.ID, http.StatusBadRequest)
+			return
+		}
+		if m.MType == models.Gauge && m.Value == nil {
+			http.Error(w, "missing value for gauge: "+m.ID, http.StatusBadRequest)
+			return
+		}
+		if m.MType == models.Counter && m.Delta == nil {
+			http.Error(w, "missing delta for counter: "+m.ID, http.StatusBadRequest)
+			return
+		}
+	}
+
+	if err := h.storage.UpdateBatch(metrics); err != nil {
+		http.Error(w, "failed to update metrics", http.StatusInternalServerError)
+		return
+	}
+
+	h.trySyncSave()
+	w.WriteHeader(http.StatusOK)
 }

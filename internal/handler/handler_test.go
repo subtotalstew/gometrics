@@ -418,3 +418,83 @@ func TestGzipMiddleware_CompressJSONResponse(t *testing.T) {
 	assert.Equal(t, http.StatusOK, res.StatusCode)
 	assert.Equal(t, "gzip", res.Header.Get("Content-Encoding"))
 }
+
+func TestPingHandler_NoDB(t *testing.T) {
+	h := handler.NewHandler(storage.NewMemStorage())
+
+	req := httptest.NewRequest(http.MethodGet, "/ping", nil)
+	w := httptest.NewRecorder()
+
+	h.PingHandler(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("PingHandler() status = %d, want %d", w.Code, http.StatusInternalServerError)
+	}
+}
+
+func TestUpdatesJSONHandler(t *testing.T) {
+	s := storage.NewMemStorage()
+	h := handler.NewHandler(s)
+
+	gaugeVal := 42.5
+	counterVal := int64(7)
+
+	metrics := []models.Metrics{
+		{ID: "TestGauge", MType: "gauge", Value: &gaugeVal},
+		{ID: "TestCounter", MType: "counter", Delta: &counterVal},
+	}
+
+	body, err := json.Marshal(metrics)
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodPost, "/updates/", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	r := chi.NewRouter()
+	r.Post("/updates/", h.UpdatesJSONHandler)
+	r.ServeHTTP(w, req)
+
+	res := w.Result()
+	defer res.Body.Close()
+
+	assert.Equal(t, http.StatusOK, res.StatusCode)
+
+	gauge, ok := s.GetGauge("TestGauge")
+	require.True(t, ok)
+	assert.Equal(t, 42.5, gauge)
+
+	counter, ok := s.GetCounter("TestCounter")
+	require.True(t, ok)
+	assert.Equal(t, int64(7), counter)
+}
+
+func TestUpdatesJSONHandler_EmptyBatch(t *testing.T) {
+	s := storage.NewMemStorage()
+	h := handler.NewHandler(s)
+
+	req := httptest.NewRequest(http.MethodPost, "/updates/", strings.NewReader("[]"))
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	r := chi.NewRouter()
+	r.Post("/updates/", h.UpdatesJSONHandler)
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Result().StatusCode)
+}
+
+func TestUpdatesJSONHandler_InvalidJSON(t *testing.T) {
+	s := storage.NewMemStorage()
+	h := handler.NewHandler(s)
+
+	req := httptest.NewRequest(http.MethodPost, "/updates/", strings.NewReader("not json"))
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	r := chi.NewRouter()
+	r.Post("/updates/", h.UpdatesJSONHandler)
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Result().StatusCode)
+}
