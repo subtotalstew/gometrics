@@ -136,7 +136,7 @@ func TestNewAgent(t *testing.T) {
 	pollInterval := 2
 	reportInterval := 10
 
-	a := NewAgent(serverAddr, pollInterval, reportInterval)
+	a := NewAgent(serverAddr, pollInterval, reportInterval, "")
 
 	if a == nil {
 		t.Fatalf("NewAgent() return nil")

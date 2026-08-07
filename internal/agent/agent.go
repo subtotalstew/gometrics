@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog/log"
+	"github.com/subtotalstew/gometrics.git/internal/hash"
 	models "github.com/subtotalstew/gometrics.git/internal/model"
 	"github.com/subtotalstew/gometrics.git/internal/retry"
 )
@@ -88,14 +89,16 @@ type Agent struct {
 	serverAddr     string
 	pollInterval   int
 	reportInterval int
+	key            string
 }
 
-func NewAgent(serverAddr string, pollInterval, reportInterval int) *Agent {
+func NewAgent(serverAddr string, pollInterval, reportInterval int, key string) *Agent {
 	return &Agent{
 		collector:      NewCollector(),
 		serverAddr:     serverAddr,
 		pollInterval:   pollInterval,
 		reportInterval: reportInterval,
+		key:            key,
 	}
 }
 
@@ -201,6 +204,10 @@ func (a *Agent) sendMetricsBatch(client *http.Client) {
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Content-Encoding", "gzip")
 		req.Header.Set("Accept-Encoding", "gzip")
+
+		if a.key != "" {
+			req.Header.Set("HashSHA256", hash.Compute(compressedBytes, a.key))
+		}
 
 		resp, err := client.Do(req)
 		if err != nil {
