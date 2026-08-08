@@ -7,6 +7,8 @@ import (
 	"syscall"
 )
 
+var ErrRetriableStatus = errors.New("retriable http status")
+
 func isRetriableHTTPError(err error) bool {
 	if err == nil {
 		return false

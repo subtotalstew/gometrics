@@ -15,12 +15,15 @@ import (
 	"time"
 
 	"github.com/rs/zerolog/log"
+	"github.com/shirou/gopsutil/v3/cpu"
+	"github.com/shirou/gopsutil/v3/mem"
 	"github.com/subtotalstew/gometrics.git/internal/hash"
 	models "github.com/subtotalstew/gometrics.git/internal/model"
 	"github.com/subtotalstew/gometrics.git/internal/retry"
 )
 
 type Collector struct {
+	mu      sync.RWMutex
 	gauge   map[string]float64
 	counter map[string]int64
 }
@@ -32,9 +35,13 @@ func NewCollector() *Collector {
 	}
 }
 
+// UpdateMetrics собирает runtime-метрики.
 func (c *Collector) UpdateMetrics() {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	c.gauge["Alloc"] = float64(m.Alloc)
 	c.gauge["BuckHashSys"] = float64(m.BuckHashSys)
@@ -67,8 +74,36 @@ func (c *Collector) UpdateMetrics() {
 	c.counter["PollCount"]++
 }
 
+// UpdateGopsutilMetrics собирает метрики памяти и CPU через gopsutil.
+func (c *Collector) UpdateGopsutilMetrics() {
+	v, err := mem.VirtualMemory()
+	if err != nil {
+		log.Error().Err(err).Msg("failed to get virtual memory stats")
+		return
+	}
+
+	cpuPercents, err := cpu.Percent(0, true)
+	if err != nil {
+		log.Error().Err(err).Msg("failed to get cpu stats")
+		return
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.gauge["TotalMemory"] = float64(v.Total)
+	c.gauge["FreeMemory"] = float64(v.Free)
+
+	for i, percent := range cpuPercents {
+		c.gauge[fmt.Sprintf("CPUutilization%d", i+1)] = percent
+	}
+}
+
 func (c *Collector) GetGauge() map[string]float64 {
-	result := make(map[string]float64)
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	result := make(map[string]float64, len(c.gauge))
 	for k, v := range c.gauge {
 		result[k] = v
 	}
@@ -76,7 +111,10 @@ func (c *Collector) GetGauge() map[string]float64 {
 }
 
 func (c *Collector) GetCounter() map[string]int64 {
-	result := make(map[string]int64)
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	result := make(map[string]int64, len(c.counter))
 	for k, v := range c.counter {
 		result[k] = v
 	}
@@ -90,15 +128,22 @@ type Agent struct {
 	pollInterval   int
 	reportInterval int
 	key            string
+	rateLimit      int
+	jobs           chan []models.Metrics
 }
 
-func NewAgent(serverAddr string, pollInterval, reportInterval int, key string) *Agent {
+func NewAgent(serverAddr string, pollInterval, reportInterval int, key string, rateLimit int) *Agent {
+	if rateLimit <= 0 {
+		rateLimit = 1
+	}
 	return &Agent{
 		collector:      NewCollector(),
 		serverAddr:     serverAddr,
 		pollInterval:   pollInterval,
 		reportInterval: reportInterval,
 		key:            key,
+		rateLimit:      rateLimit,
+		jobs:           make(chan []models.Metrics, rateLimit),
 	}
 }
 
@@ -106,11 +151,22 @@ func (a *Agent) Run() {
 	log.Info().
 		Int("poll_interval", a.pollInterval).
 		Int("report_interval", a.reportInterval).
+		Int("rate_limit", a.rateLimit).
 		Str("server_addr", a.serverAddr).
 		Msg("starting agent")
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	// Запускаем worker pool — rateLimit воркеров читают из jobs и отправляют батчи.
+	var wg sync.WaitGroup
+	for i := 0; i < a.rateLimit; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			a.worker()
+		}()
+	}
 
 	pollTicker := time.NewTicker(time.Duration(a.pollInterval) * time.Second)
 	defer pollTicker.Stop()
@@ -118,84 +174,100 @@ func (a *Agent) Run() {
 	reportTicker := time.NewTicker(time.Duration(a.reportInterval) * time.Second)
 	defer reportTicker.Stop()
 
-	a.collector.UpdateMetrics()
-	a.sendMetrics()
-	log.Info().Msg("initial metrics collected and sent")
+	// Горутина 1: сбор runtime-метрик.
+	go func() {
+		for range pollTicker.C {
+			a.collector.UpdateMetrics()
+			log.Debug().Msg("runtime metrics updated")
+		}
+	}()
 
+	// Горутина 2: сбор gopsutil-метрик (память, CPU).
+	go func() {
+		for range pollTicker.C {
+			a.collector.UpdateGopsutilMetrics()
+			log.Debug().Msg("gopsutil metrics updated")
+		}
+	}()
+
+	// Основной цикл: по тикеру формируем батч и кладём в jobs для воркеров.
 	for {
 		select {
-		case <-pollTicker.C:
-			a.collector.UpdateMetrics()
-			log.Debug().
-				Int64("poll_count", a.collector.counter["PollCount"]).
-				Msg("metrics updated")
 		case <-reportTicker.C:
-			a.sendMetrics()
-			log.Info().Msg("metrics sent to server")
-		case signal := <-sigChan:
-			log.Info().
-				Str("signal", signal.String()).
-				Msg("agent shutting down gracefully")
+			batch := a.collectBatch()
+			if len(batch) > 0 {
+				a.jobs <- batch
+			}
+		case sig := <-sigChan:
+			log.Info().Str("signal", sig.String()).Msg("agent shutting down gracefully")
+			// Закрываем канал — воркеры завершатся после обработки оставшихся батчей.
+			close(a.jobs)
+			wg.Wait()
 			return
 		}
 	}
 }
 
-func (a *Agent) sendMetrics() {
-	client := &http.Client{Timeout: 5 * time.Second}
-	a.sendMetricsBatch(client)
-}
-
-func (a *Agent) sendMetricsBatch(client *http.Client) {
+// collectBatch снимает текущий снапшот метрик и формирует батч для отправки.
+func (a *Agent) collectBatch() []models.Metrics {
 	gauges := a.collector.GetGauge()
 	counters := a.collector.GetCounter()
 
 	metrics := make([]models.Metrics, 0, len(gauges)+len(counters))
 
 	for name, value := range gauges {
-		valCopy := value
+		v := value
 		metrics = append(metrics, models.Metrics{
 			ID:    name,
 			MType: models.Gauge,
-			Value: &valCopy,
+			Value: &v,
 		})
 	}
 
 	for name, value := range counters {
-		deltaCopy := value
+		d := value
 		metrics = append(metrics, models.Metrics{
 			ID:    name,
 			MType: models.Counter,
-			Delta: &deltaCopy,
+			Delta: &d,
 		})
 	}
 
-	if len(metrics) == 0 {
-		log.Debug().Msg("нет метрик для отправки, батч пропущен")
-		return
-	}
+	return metrics
+}
 
+// worker читает батчи из канала jobs и отправляет их на сервер.
+// Завершается когда канал закрыт.
+func (a *Agent) worker() {
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	for batch := range a.jobs {
+		if err := a.sendBatch(client, batch); err != nil {
+			log.Error().Err(err).Msg("worker failed to send batch")
+		}
+	}
+}
+
+// sendBatch сжимает батч метрик и отправляет на сервер с retry-логикой.
+func (a *Agent) sendBatch(client *http.Client, metrics []models.Metrics) error {
 	body, err := json.Marshal(metrics)
 	if err != nil {
-		log.Error().Err(err).Int("count", len(metrics)).Msg("failed to marshal metrics batch")
-		return
+		return fmt.Errorf("marshal: %w", err)
 	}
 
-	var compressed bytes.Buffer
-	gz := gzip.NewWriter(&compressed)
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
 	if _, err := gz.Write(body); err != nil {
-		log.Error().Err(err).Msg("failed to write gzip body")
-		return
+		return fmt.Errorf("gzip write: %w", err)
 	}
 	if err := gz.Close(); err != nil {
-		log.Error().Err(err).Msg("failed to close gzip writer")
-		return
+		return fmt.Errorf("gzip close: %w", err)
 	}
-	compressedBytes := compressed.Bytes()
+	compressedBytes := buf.Bytes()
 
 	url := fmt.Sprintf("%s/updates/", a.serverAddr)
 
-	sendOnce := func() error {
+	return retry.Do("send_batch", func() error {
 		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(compressedBytes))
 		if err != nil {
 			return err
@@ -216,85 +288,9 @@ func (a *Agent) sendMetricsBatch(client *http.Client) {
 		defer resp.Body.Close()
 
 		if isRetriableStatus(resp.StatusCode) {
-			return fmt.Errorf("server returned retriable status %d", resp.StatusCode)
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			return nil
+			return fmt.Errorf("%w: status %d", ErrRetriableStatus, resp.StatusCode)
 		}
 
 		return nil
-	}
-
-	err = retry.Do("send_metrics_batch", sendOnce, func(err error) bool {
-		return isRetriableHTTPError(err)
-	})
-
-	if err != nil {
-		log.Error().Err(err).Int("count", len(metrics)).Msg("failed to send metrics batch after retries")
-		return
-	}
-
-	log.Info().Int("count", len(metrics)).Msg("metrics batch sent successfully")
-}
-
-func (a *Agent) sendMetricJSON(client *http.Client, metric models.Metrics) {
-	url := fmt.Sprintf("%s/update", a.serverAddr)
-	body, err := json.Marshal(metric)
-	if err != nil {
-		log.Error().
-			Err(err).
-			Str("metric", metric.ID).
-			Str("type", metric.MType).
-			Msg("failed to marshal metric")
-		return
-	}
-
-	var buf bytes.Buffer
-	gz := gzip.NewWriter(&buf)
-	if _, err := gz.Write(body); err != nil {
-		log.Error().Err(err).Msg("failed to write gzip body")
-		return
-	}
-	if err := gz.Close(); err != nil {
-		log.Error().Err(err).Msg("failed to close gzip writer")
-		return
-	}
-
-	req, err := http.NewRequest(http.MethodPost, url, &buf)
-	if err != nil {
-		log.Error().
-			Err(err).
-			Str("metric", metric.ID).
-			Msg("failed to create request")
-		return
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Content-Encoding", "gzip")
-	req.Header.Set("Accept-Encoding", "gzip")
-
-	log.Debug().
-		Str("metric_id", metric.ID).
-		Int("original_size", len(body)).
-		Int("compressed_size", buf.Len()).
-		Interface("headers", req.Header).
-		Msg("sending outgoing agent request")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Error().
-			Err(err).
-			Str("metric", metric.ID).
-			Msg("failed to send metric")
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		log.Warn().
-			Int("status_code", resp.StatusCode).
-			Str("metric", metric.ID).
-			Msg("unexpected response status")
-	}
+	}, isRetriableHTTPError)
 }
