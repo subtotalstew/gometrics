@@ -3,6 +3,7 @@ package agent
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"fmt"
 	"math/rand"
@@ -15,12 +16,16 @@ import (
 	"time"
 
 	"github.com/rs/zerolog/log"
+	"github.com/shirou/gopsutil/v3/cpu"
+	"github.com/shirou/gopsutil/v3/mem"
+
 	"github.com/subtotalstew/gometrics.git/internal/hash"
 	models "github.com/subtotalstew/gometrics.git/internal/model"
 	"github.com/subtotalstew/gometrics.git/internal/retry"
 )
 
 type Collector struct {
+	mu      sync.Mutex
 	gauge   map[string]float64
 	counter map[string]int64
 }
@@ -67,8 +72,34 @@ func (c *Collector) UpdateMetrics() {
 	c.counter["PollCount"]++
 }
 
+func (c *Collector) UpdatePSUtilMetrics() error {
+	vm, err := mem.VirtualMemory()
+	if err != nil {
+		return fmt.Errorf("gopsutil: не удалось получить данные о памяти: %w", err)
+	}
+
+	// interval=0 -> мгновенный процент с момента предыдущего вызова, без блокировки.
+	percentages, err := cpu.Percent(0, true)
+	if err != nil {
+		return fmt.Errorf("gopsutil: не удалось получить загрузку CPU: %w", err)
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.gauge["TotalMemory"] = float64(vm.Total)
+	c.gauge["FreeMemory"] = float64(vm.Free)
+	for i, p := range percentages {
+		c.gauge[fmt.Sprintf("CPUutilization%d", i+1)] = p
+	}
+
+	return nil
+}
+
 func (c *Collector) GetGauge() map[string]float64 {
-	result := make(map[string]float64)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	result := make(map[string]float64, len(c.gauge))
 	for k, v := range c.gauge {
 		result[k] = v
 	}
@@ -76,7 +107,9 @@ func (c *Collector) GetGauge() map[string]float64 {
 }
 
 func (c *Collector) GetCounter() map[string]int64 {
-	result := make(map[string]int64)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	result := make(map[string]int64, len(c.counter))
 	for k, v := range c.counter {
 		result[k] = v
 	}
@@ -89,16 +122,23 @@ type Agent struct {
 	serverAddr     string
 	pollInterval   int
 	reportInterval int
+	rateLimit      int
 	key            string
+	client         *http.Client
 }
 
-func NewAgent(serverAddr string, pollInterval, reportInterval int, key string) *Agent {
+func NewAgent(serverAddr string, pollInterval, reportInterval, rateLimit int, key string) *Agent {
+	if rateLimit <= 0 {
+		rateLimit = 1
+	}
 	return &Agent{
 		collector:      NewCollector(),
 		serverAddr:     serverAddr,
 		pollInterval:   pollInterval,
 		reportInterval: reportInterval,
+		rateLimit:      rateLimit,
 		key:            key,
+		client:         &http.Client{Timeout: 5 * time.Second},
 	}
 }
 
@@ -109,44 +149,103 @@ func (a *Agent) Run() {
 		Str("server_addr", a.serverAddr).
 		Msg("starting agent")
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
-	pollTicker := time.NewTicker(time.Duration(a.pollInterval) * time.Second)
-	defer pollTicker.Stop()
+	jobs := make(chan []models.Metrics, a.rateLimit)
 
-	reportTicker := time.NewTicker(time.Duration(a.reportInterval) * time.Second)
-	defer reportTicker.Stop()
+	var workersWG sync.WaitGroup
+	for i := 0; i < a.rateLimit; i++ {
+		workersWG.Add(1)
+		go a.worker(i, jobs, &workersWG)
+	}
+
+	var pollersWG sync.WaitGroup
+
+	pollersWG.Add(1)
+	go a.runRuntimePoller(ctx, &pollersWG)
+
+	pollersWG.Add(1)
+	go a.runPSUtilPoller(ctx, &pollersWG)
+
+	pollersWG.Add(1)
+	go a.runReporter(ctx, jobs, &pollersWG)
+
+	<-sigChan
+	log.Info().Msg("agent shutting down gracefully")
+
+	cancel()
+	pollersWG.Wait()
+
+	close(jobs)
+	workersWG.Wait()
+
+	log.Info().Msg("agent stopped")
+}
+
+func (a *Agent) runRuntimePoller(ctx context.Context, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	ticker := time.NewTicker(time.Duration(a.pollInterval) * time.Second)
+	defer ticker.Stop()
 
 	a.collector.UpdateMetrics()
-	a.sendMetrics()
-	log.Info().Msg("initial metrics collected and sent")
 
 	for {
 		select {
-		case <-pollTicker.C:
+		case <-ticker.C:
 			a.collector.UpdateMetrics()
-			log.Debug().
-				Int64("poll_count", a.collector.counter["PollCount"]).
-				Msg("metrics updated")
-		case <-reportTicker.C:
-			a.sendMetrics()
-			log.Info().Msg("metrics sent to server")
-		case signal := <-sigChan:
-			log.Info().
-				Str("signal", signal.String()).
-				Msg("agent shutting down gracefully")
+			log.Debug().Msg("runtime metrics updated")
+		case <-ctx.Done():
 			return
 		}
 	}
 }
 
-func (a *Agent) sendMetrics() {
-	client := &http.Client{Timeout: 5 * time.Second}
-	a.sendMetricsBatch(client)
+func (a *Agent) runPSUtilPoller(ctx context.Context, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	ticker := time.NewTicker(time.Duration(a.pollInterval) * time.Second)
+	defer ticker.Stop()
+
+	if err := a.collector.UpdatePSUtilMetrics(); err != nil {
+		log.Error().Err(err).Msg("failed to collect gopsutil metrics")
+	}
+
+	for {
+		select {
+		case <-ticker.C:
+			if err := a.collector.UpdatePSUtilMetrics(); err != nil {
+				log.Error().Err(err).Msg("failed to collect gopsutil metrics")
+				continue
+			}
+			log.Debug().Msg("gopsutil metrics updated")
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
-func (a *Agent) sendMetricsBatch(client *http.Client) {
+func (a *Agent) runReporter(ctx context.Context, jobs chan<- []models.Metrics, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	ticker := time.NewTicker(time.Duration(a.reportInterval) * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			a.enqueueMetrics(ctx, jobs)
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (a *Agent) enqueueMetrics(ctx context.Context, jobs chan<- []models.Metrics) {
 	gauges := a.collector.GetGauge()
 	counters := a.collector.GetCounter()
 
@@ -175,6 +274,21 @@ func (a *Agent) sendMetricsBatch(client *http.Client) {
 		return
 	}
 
+	select {
+	case jobs <- metrics:
+	case <-ctx.Done():
+	}
+}
+
+func (a *Agent) worker(id int, jobs <-chan []models.Metrics, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for metrics := range jobs {
+		log.Debug().Int("worker_id", id).Int("count", len(metrics)).Msg("worker sending batch")
+		a.sendMetricsBatch(metrics)
+	}
+}
+
+func (a *Agent) sendMetricsBatch(metrics []models.Metrics) {
 	body, err := json.Marshal(metrics)
 	if err != nil {
 		log.Error().Err(err).Int("count", len(metrics)).Msg("failed to marshal metrics batch")
@@ -209,7 +323,7 @@ func (a *Agent) sendMetricsBatch(client *http.Client) {
 			req.Header.Set("HashSHA256", hash.Compute(compressedBytes, a.key))
 		}
 
-		resp, err := client.Do(req)
+		resp, err := a.client.Do(req)
 		if err != nil {
 			return err
 		}
@@ -217,10 +331,6 @@ func (a *Agent) sendMetricsBatch(client *http.Client) {
 
 		if isRetriableStatus(resp.StatusCode) {
 			return fmt.Errorf("server returned retriable status %d", resp.StatusCode)
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			return nil
 		}
 
 		return nil
@@ -274,12 +384,9 @@ func (a *Agent) sendMetricJSON(client *http.Client, metric models.Metrics) {
 	req.Header.Set("Content-Encoding", "gzip")
 	req.Header.Set("Accept-Encoding", "gzip")
 
-	log.Debug().
-		Str("metric_id", metric.ID).
-		Int("original_size", len(body)).
-		Int("compressed_size", buf.Len()).
-		Interface("headers", req.Header).
-		Msg("sending outgoing agent request")
+	if a.key != "" {
+		req.Header.Set("HashSHA256", hash.Compute(buf.Bytes(), a.key))
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {
