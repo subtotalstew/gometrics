@@ -41,6 +41,9 @@ func (c *Collector) UpdateMetrics() {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
 
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	c.gauge["Alloc"] = float64(m.Alloc)
 	c.gauge["BuckHashSys"] = float64(m.BuckHashSys)
 	c.gauge["Frees"] = float64(m.Frees)

@@ -491,25 +491,39 @@ func (h *Handler) HashMiddleware(next http.Handler) http.Handler {
 			}
 		}
 
-		hrw := &hashResponseWriter{ResponseWriter: w, key: h.key}
+		hrw := &hashResponseWriter{
+			ResponseWriter: w,
+			key:            h.key,
+			status:         http.StatusOK,
+		}
+
 		next.ServeHTTP(hrw, r)
+
+		hrw.finalize()
 	})
 }
 
 type hashResponseWriter struct {
 	http.ResponseWriter
-	key  string
-	body bytes.Buffer
+	key    string
+	body   bytes.Buffer
+	status int
 }
 
 func (hrw *hashResponseWriter) Write(b []byte) (int, error) {
-	hrw.body.Write(b)
-	return hrw.ResponseWriter.Write(b)
+	return hrw.body.Write(b)
 }
 
 func (hrw *hashResponseWriter) WriteHeader(statusCode int) {
-	if hrw.key != "" {
+	hrw.status = statusCode
+}
+
+func (hrw *hashResponseWriter) finalize() {
+	if hrw.key != "" && hrw.body.Len() > 0 {
 		hrw.ResponseWriter.Header().Set("HashSHA256", hash.Compute(hrw.body.Bytes(), hrw.key))
 	}
-	hrw.ResponseWriter.WriteHeader(statusCode)
+	hrw.ResponseWriter.WriteHeader(hrw.status)
+	if hrw.body.Len() > 0 {
+		_, _ = hrw.ResponseWriter.Write(hrw.body.Bytes())
+	}
 }
