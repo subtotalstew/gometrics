@@ -24,6 +24,7 @@ func main() {
 		filePath      string
 		restore       bool
 		databaseDSN   string
+		key           string
 	)
 
 	flag.StringVar(&addr, "a", "localhost:8080", "address and port to run server, format: <hostname>:<port>")
@@ -31,6 +32,7 @@ func main() {
 	flag.StringVar(&filePath, "f", "metrics-store.json", "path to file for persisting metrics")
 	flag.BoolVar(&restore, "r", true, "whether to restore previously saved metrics on start")
 	flag.StringVar(&databaseDSN, "d", "", "database connection string")
+	flag.StringVar(&key, "k", "", "key for decrypt")
 
 	flag.Parse()
 
@@ -56,6 +58,10 @@ func main() {
 	}
 	if envDSN := os.Getenv("DATABASE_DSN"); envDSN != "" {
 		databaseDSN = envDSN
+	}
+
+	if envKey := os.Getenv("KEY"); envKey != "" {
+		key = envKey
 	}
 
 	log.Info().Msgf("Starting server on %s", addr)
@@ -120,6 +126,11 @@ func main() {
 	}
 
 	r := chi.NewRouter()
+
+	if key != "" {
+		h.SetKey(key)
+		r.Use(h.HashMiddleware)
+	}
 
 	r.Use(h.GzipMiddleware)
 	r.Use(h.LoggingMiddleware)

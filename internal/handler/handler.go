@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/hmac"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/rs/zerolog/log"
+	"github.com/subtotalstew/gometrics.git/internal/hash"
 	models "github.com/subtotalstew/gometrics.git/internal/model"
 	"github.com/subtotalstew/gometrics.git/internal/storage"
 )
@@ -23,6 +25,11 @@ type Handler struct {
 	storage  storage.Storage
 	syncSave func()
 	db       *sql.DB
+	key      string
+}
+
+func (h *Handler) SetKey(key string) {
+	h.key = key
 }
 
 func NewHandler(storage storage.Storage) *Handler {
@@ -460,4 +467,63 @@ func (h *Handler) UpdatesJSONHandler(w http.ResponseWriter, r *http.Request) {
 
 	h.trySyncSave()
 	w.WriteHeader(http.StatusOK)
+}
+
+func (h *Handler) HashMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if h.key == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "failed to read body", http.StatusInternalServerError)
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+
+		if incoming := r.Header.Get("HashSHA256"); incoming != "" {
+			expected := hash.Compute(body, h.key)
+			if !hmac.Equal([]byte(incoming), []byte(expected)) {
+				http.Error(w, "invalid hash", http.StatusBadRequest)
+				return
+			}
+		}
+
+		hrw := &hashResponseWriter{
+			ResponseWriter: w,
+			key:            h.key,
+			status:         http.StatusOK,
+		}
+
+		next.ServeHTTP(hrw, r)
+
+		hrw.finalize()
+	})
+}
+
+type hashResponseWriter struct {
+	http.ResponseWriter
+	key    string
+	body   bytes.Buffer
+	status int
+}
+
+func (hrw *hashResponseWriter) Write(b []byte) (int, error) {
+	return hrw.body.Write(b)
+}
+
+func (hrw *hashResponseWriter) WriteHeader(statusCode int) {
+	hrw.status = statusCode
+}
+
+func (hrw *hashResponseWriter) finalize() {
+	if hrw.key != "" && hrw.body.Len() > 0 {
+		hrw.ResponseWriter.Header().Set("HashSHA256", hash.Compute(hrw.body.Bytes(), hrw.key))
+	}
+	hrw.ResponseWriter.WriteHeader(hrw.status)
+	if hrw.body.Len() > 0 {
+		_, _ = hrw.ResponseWriter.Write(hrw.body.Bytes())
+	}
 }

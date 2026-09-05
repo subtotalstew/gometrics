@@ -14,11 +14,15 @@ func main() {
 		addr           string
 		pollInterval   int
 		reportInterval int
+		key            string
+		rateLimit      int
 	)
 
 	flag.StringVar(&addr, "a", "localhost:8080", "server address")
 	flag.IntVar(&pollInterval, "p", 2, "poll interval in seconds")
 	flag.IntVar(&reportInterval, "r", 10, "report interval in seconds")
+	flag.StringVar(&key, "k", "", "key for encrypt")
+	flag.IntVar(&rateLimit, "l", 1, "max number of simultaneously outgoing requests to the server")
 
 	flag.Parse()
 
@@ -42,6 +46,18 @@ func main() {
 		reportInterval = val
 	}
 
-	a := agent.NewAgent("http://"+addr, pollInterval, reportInterval)
+	if envKey := os.Getenv("KEY"); envKey != "" {
+		key = envKey
+	}
+
+	if envRateLimit := os.Getenv("RATE_LIMIT"); envRateLimit != "" {
+		val, err := strconv.Atoi(envRateLimit)
+		if err != nil {
+			log.Fatalf("неверный формат RATE_LIMIT: %v", err)
+		}
+		rateLimit = val
+	}
+
+	a := agent.NewAgent("http://"+addr, pollInterval, reportInterval, rateLimit, key)
 	a.Run()
 }
