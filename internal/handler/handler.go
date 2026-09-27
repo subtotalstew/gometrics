@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/rs/zerolog/log"
+	"github.com/subtotalstew/gometrics.git/internal/audit"
 	"github.com/subtotalstew/gometrics.git/internal/hash"
 	models "github.com/subtotalstew/gometrics.git/internal/model"
 	"github.com/subtotalstew/gometrics.git/internal/storage"
@@ -26,6 +28,7 @@ type Handler struct {
 	syncSave func()
 	db       *sql.DB
 	key      string
+	audit    *audit.Subject
 }
 
 func (h *Handler) SetKey(key string) {
@@ -44,6 +47,35 @@ func (h *Handler) trySyncSave() {
 	if h.syncSave != nil {
 		h.syncSave()
 	}
+}
+
+func (h *Handler) SetAudit(subject *audit.Subject) {
+	h.audit = subject
+}
+
+func clientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		// Первый адрес в цепочке — клиентский
+		if idx := strings.Index(xff, ","); idx != -1 {
+			return strings.TrimSpace(xff[:idx])
+		}
+		return strings.TrimSpace(xff)
+	}
+	if xri := r.Header.Get("X-Real-IP"); xri != "" {
+		return strings.TrimSpace(xri)
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+func (h *Handler) notifyAudit(r *http.Request, metricNames []string) {
+	if h.audit == nil || len(metricNames) == 0 {
+		return
+	}
+	h.audit.Notify(audit.NewEvent(metricNames, clientIP(r)))
 }
 
 func (h *Handler) SetDB(db *sql.DB) {
@@ -94,8 +126,9 @@ func (h *Handler) UpdateHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		w.WriteHeader(http.StatusOK)
 		h.trySyncSave()
+		h.notifyAudit(r, []string{metricName})
+		w.WriteHeader(http.StatusOK)
 
 	case "counter":
 		value, err := strconv.ParseInt(metricValue, 10, 64)
@@ -107,8 +140,9 @@ func (h *Handler) UpdateHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		w.WriteHeader(http.StatusOK)
 		h.trySyncSave()
+		h.notifyAudit(r, []string{metricName})
+		w.WriteHeader(http.StatusOK)
 
 	default:
 		http.Error(w, "Invalid metric type", http.StatusBadRequest)
@@ -317,6 +351,7 @@ func (h *Handler) UpdateJSONHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.trySyncSave()
+		h.notifyAudit(r, []string{req.ID})
 
 	case models.Counter:
 		if req.Delta == nil {
@@ -328,6 +363,7 @@ func (h *Handler) UpdateJSONHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.trySyncSave()
+		h.notifyAudit(r, []string{req.ID})
 		cur, _ := h.storage.GetCounter(req.ID)
 		req.Delta = &cur
 
@@ -466,6 +502,11 @@ func (h *Handler) UpdatesJSONHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.trySyncSave()
+	names := make([]string, 0, len(metrics))
+	for _, m := range metrics {
+		names = append(names, m.ID)
+	}
+	h.notifyAudit(r, names)
 	w.WriteHeader(http.StatusOK)
 }
 

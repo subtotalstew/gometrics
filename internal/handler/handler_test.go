@@ -1,4 +1,4 @@
-package handler_test
+package handler
 
 import (
 	"bytes"
@@ -13,7 +13,6 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/subtotalstew/gometrics.git/internal/handler"
 	models "github.com/subtotalstew/gometrics.git/internal/model"
 	"github.com/subtotalstew/gometrics.git/internal/storage"
 )
@@ -195,7 +194,7 @@ func TestUpdateHandler(t *testing.T) {
 
 			s := storage.NewMemStorage()
 
-			h := handler.NewHandler(s)
+			h := NewHandler(s)
 
 			r := chi.NewRouter()
 			r.Post("/update/{type}/{name}/{value}", h.UpdateHandler)
@@ -273,7 +272,7 @@ func TestValueHandler(t *testing.T) {
 				tt.setupStore(s)
 			}
 
-			h := handler.NewHandler(s)
+			h := NewHandler(s)
 			r := chi.NewRouter()
 			r.Get("/value/{type}/{name}", h.ValueHandler)
 			r.ServeHTTP(w, request)
@@ -292,7 +291,7 @@ func TestValueHandler(t *testing.T) {
 
 func TestUpdateJSONHandler_Gauge(t *testing.T) {
 	s := storage.NewMemStorage()
-	h := handler.NewHandler(s)
+	h := NewHandler(s)
 
 	body := `{"id":"LastGC","type":"gauge","value":1744184459}`
 	req := httptest.NewRequest(http.MethodPost, "/update", strings.NewReader(body))
@@ -316,7 +315,7 @@ func TestUpdateJSONHandler_Gauge(t *testing.T) {
 
 func TestUpdateJSONHandler_Counter(t *testing.T) {
 	s := storage.NewMemStorage()
-	h := handler.NewHandler(s)
+	h := NewHandler(s)
 
 	body := `{"id":"PollCount","type":"counter","delta":5}`
 	req := httptest.NewRequest(http.MethodPost, "/update", strings.NewReader(body))
@@ -341,7 +340,7 @@ func TestUpdateJSONHandler_Counter(t *testing.T) {
 func TestValueJSONHandler(t *testing.T) {
 	s := storage.NewMemStorage()
 	_ = s.SetGauge("LastGC", 1744184459)
-	h := handler.NewHandler(s)
+	h := NewHandler(s)
 
 	body := `{"id":"LastGC","type":"gauge"}`
 	req := httptest.NewRequest(http.MethodPost, "/value", strings.NewReader(body))
@@ -377,7 +376,7 @@ func compressData(t *testing.T, data []byte) []byte {
 
 func TestGzipMiddleware_DecompressRequest(t *testing.T) {
 	s := storage.NewMemStorage()
-	h := handler.NewHandler(s)
+	h := NewHandler(s)
 	r := chi.NewRouter()
 	r.Use(h.GzipMiddleware)
 	r.Post("/update", h.UpdateJSONHandler)
@@ -400,7 +399,7 @@ func TestGzipMiddleware_DecompressRequest(t *testing.T) {
 func TestGzipMiddleware_CompressJSONResponse(t *testing.T) {
 	s := storage.NewMemStorage()
 	_ = s.SetGauge("TestGzipGauge", 100.5)
-	h := handler.NewHandler(s)
+	h := NewHandler(s)
 	r := chi.NewRouter()
 	r.Use(h.GzipMiddleware)
 	r.Post("/value", h.ValueJSONHandler)
@@ -420,7 +419,7 @@ func TestGzipMiddleware_CompressJSONResponse(t *testing.T) {
 }
 
 func TestPingHandler_NoDB(t *testing.T) {
-	h := handler.NewHandler(storage.NewMemStorage())
+	h := NewHandler(storage.NewMemStorage())
 
 	req := httptest.NewRequest(http.MethodGet, "/ping", nil)
 	w := httptest.NewRecorder()
@@ -434,7 +433,7 @@ func TestPingHandler_NoDB(t *testing.T) {
 
 func TestUpdatesJSONHandler(t *testing.T) {
 	s := storage.NewMemStorage()
-	h := handler.NewHandler(s)
+	h := NewHandler(s)
 
 	gaugeVal := 42.5
 	counterVal := int64(7)
@@ -471,7 +470,7 @@ func TestUpdatesJSONHandler(t *testing.T) {
 
 func TestUpdatesJSONHandler_EmptyBatch(t *testing.T) {
 	s := storage.NewMemStorage()
-	h := handler.NewHandler(s)
+	h := NewHandler(s)
 
 	req := httptest.NewRequest(http.MethodPost, "/updates/", strings.NewReader("[]"))
 	req.Header.Set("Content-Type", "application/json")
@@ -486,7 +485,7 @@ func TestUpdatesJSONHandler_EmptyBatch(t *testing.T) {
 
 func TestUpdatesJSONHandler_InvalidJSON(t *testing.T) {
 	s := storage.NewMemStorage()
-	h := handler.NewHandler(s)
+	h := NewHandler(s)
 
 	req := httptest.NewRequest(http.MethodPost, "/updates/", strings.NewReader("not json"))
 	req.Header.Set("Content-Type", "application/json")
@@ -497,4 +496,71 @@ func TestUpdatesJSONHandler_InvalidJSON(t *testing.T) {
 	r.ServeHTTP(w, req)
 
 	assert.Equal(t, http.StatusBadRequest, w.Result().StatusCode)
+}
+
+func TestClientIP(t *testing.T) {
+	tests := []struct {
+		name       string
+		remoteAddr string
+		headers    map[string]string
+		want       string
+	}{
+		{
+			name:       "RemoteAddr with port",
+			remoteAddr: "192.168.0.42:12345",
+			want:       "192.168.0.42",
+		},
+		{
+			name:       "RemoteAddr without port",
+			remoteAddr: "192.168.0.42",
+			want:       "192.168.0.42",
+		},
+		{
+			name:       "X-Forwarded-For single",
+			remoteAddr: "10.0.0.1:12345",
+			headers:    map[string]string{"X-Forwarded-For": "192.168.0.42"},
+			want:       "192.168.0.42",
+		},
+		{
+			name:       "X-Forwarded-For chain",
+			remoteAddr: "10.0.0.1:12345",
+			headers:    map[string]string{"X-Forwarded-For": "192.168.0.42, 10.0.0.2, 10.0.0.3"},
+			want:       "192.168.0.42",
+		},
+		{
+			name:       "X-Real-IP",
+			remoteAddr: "10.0.0.1:12345",
+			headers:    map[string]string{"X-Real-IP": "192.168.0.42"},
+			want:       "192.168.0.42",
+		},
+		{
+			name:       "X-Forwarded-For takes precedence over X-Real-IP",
+			remoteAddr: "10.0.0.1:12345",
+			headers: map[string]string{
+				"X-Forwarded-For": "192.168.0.42",
+				"X-Real-IP":       "10.0.0.99",
+			},
+			want: "192.168.0.42",
+		},
+		{
+			name:       "IPv6 RemoteAddr",
+			remoteAddr: "[2001:db8::1]:12345",
+			want:       "2001:db8::1",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "/", nil)
+			req.RemoteAddr = tt.remoteAddr
+			for k, v := range tt.headers {
+				req.Header.Set(k, v)
+			}
+
+			got := clientIP(req)
+			if got != tt.want {
+				t.Errorf("clientIP() = %q, want %q", got, tt.want)
+			}
+		})
+	}
 }
