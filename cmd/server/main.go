@@ -14,6 +14,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/subtotalstew/gometrics.git/internal/audit"
 	"github.com/subtotalstew/gometrics.git/internal/handler"
+	"github.com/subtotalstew/gometrics.git/internal/profiler"
 	"github.com/subtotalstew/gometrics.git/internal/storage"
 )
 
@@ -28,6 +29,7 @@ func main() {
 		key           string
 		auditFile     string
 		auditURL      string
+		pprofAddr     string
 	)
 
 	flag.StringVar(&addr, "a", "localhost:8080", "address and port to run server, format: <hostname>:<port>")
@@ -38,6 +40,7 @@ func main() {
 	flag.StringVar(&key, "k", "", "key for decrypt")
 	flag.StringVar(&auditFile, "audit-file", "", "path to audit log file")
 	flag.StringVar(&auditURL, "audit-url", "", "URL for audit log delivery")
+	flag.StringVar(&pprofAddr, "pprof-addr", "", "address of the pprof/debug HTTP server (empty = disabled)")
 
 	flag.Parse()
 
@@ -73,7 +76,20 @@ func main() {
 	if envAuditURL := os.Getenv("AUDIT_URL"); envAuditURL != "" {
 		auditURL = envAuditURL
 	}
+	if envPprofAddr := os.Getenv("PPROF_ADDR"); envPprofAddr != "" {
+		pprofAddr = envPprofAddr
+	}
 	log.Info().Msgf("Starting server on %s", addr)
+
+	var pprofSrv *http.Server
+	if pprofAddr != "" {
+		var err error
+		pprofSrv, err = profiler.Start(pprofAddr)
+		if err != nil {
+			log.Fatal().Err(err).Msg("не удалось запустить pprof-сервер")
+		}
+		log.Info().Str("addr", pprofSrv.Addr).Msg("pprof-сервер запущен")
+	}
 
 	var (
 		metricsStorage storage.Storage
@@ -198,6 +214,10 @@ func main() {
 
 	if dbStorage != nil {
 		_ = dbStorage.Close()
+	}
+
+	if pprofSrv != nil {
+		_ = pprofSrv.Close()
 	}
 
 	_ = srv.Close()

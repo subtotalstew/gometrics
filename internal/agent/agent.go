@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/rand"
 	"net/http"
 	"os"
@@ -23,6 +24,27 @@ import (
 	models "github.com/subtotalstew/gometrics.git/internal/model"
 	"github.com/subtotalstew/gometrics.git/internal/retry"
 )
+
+// gzipWriterPool переиспользует gzip.Writer: каждый новый экземпляр
+// резервирует сотни килобайт под словари и состояние deflate, а агент
+// сжимает батч на каждом цикле отправки.
+var gzipWriterPool = sync.Pool{
+	New: func() any {
+		return gzip.NewWriter(io.Discard)
+	},
+}
+
+// compressGzip сжимает data в dst, переиспользуя writer из пула.
+func compressGzip(dst *bytes.Buffer, data []byte) error {
+	gz := gzipWriterPool.Get().(*gzip.Writer)
+	defer gzipWriterPool.Put(gz)
+
+	gz.Reset(dst)
+	if _, err := gz.Write(data); err != nil {
+		return err
+	}
+	return gz.Close()
+}
 
 type Collector struct {
 	mu      sync.Mutex
@@ -299,13 +321,8 @@ func (a *Agent) sendMetricsBatch(metrics []models.Metrics) {
 	}
 
 	var compressed bytes.Buffer
-	gz := gzip.NewWriter(&compressed)
-	if _, err := gz.Write(body); err != nil {
-		log.Error().Err(err).Msg("failed to write gzip body")
-		return
-	}
-	if err := gz.Close(); err != nil {
-		log.Error().Err(err).Msg("failed to close gzip writer")
+	if err := compressGzip(&compressed, body); err != nil {
+		log.Error().Err(err).Msg("failed to gzip body")
 		return
 	}
 	compressedBytes := compressed.Bytes()
@@ -364,13 +381,8 @@ func (a *Agent) sendMetricJSON(client *http.Client, metric models.Metrics) {
 	}
 
 	var buf bytes.Buffer
-	gz := gzip.NewWriter(&buf)
-	if _, err := gz.Write(body); err != nil {
-		log.Error().Err(err).Msg("failed to write gzip body")
-		return
-	}
-	if err := gz.Close(); err != nil {
-		log.Error().Err(err).Msg("failed to close gzip writer")
+	if err := compressGzip(&buf, body); err != nil {
+		log.Error().Err(err).Msg("failed to gzip body")
 		return
 	}
 

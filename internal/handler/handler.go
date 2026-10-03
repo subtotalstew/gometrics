@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -176,11 +177,8 @@ func (h *Handler) ValueHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (h *Handler) RootHandler(w http.ResponseWriter, r *http.Request) {
-	gauges, counters := h.storage.GetAllMetrics()
-
-	var html strings.Builder
-	html.WriteString(`<!DOCTYPE html>
+const (
+	rootPageGaugeHead = `<!DOCTYPE html>
 <html>
 <head>
     <title>Metrics</title>
@@ -195,36 +193,73 @@ func (h *Handler) RootHandler(w http.ResponseWriter, r *http.Request) {
     <h1>All Metrics</h1>
     <h2>Gauge Metrics</h2>
     <table>
-        <tr><th>Name</th><th>Value</th></tr>`)
+        <tr><th>Name</th><th>Value</th></tr>`
 
-	if len(gauges) == 0 {
-		html.WriteString(`<tr><td colspan="2">No gauge metrics</td></tr>`)
-	} else {
-		for name, value := range gauges {
-			fmt.Fprintf(&html, `<tr><td>%s</td><td>%g</td></tr>`, name, value)
-		}
-	}
-
-	html.WriteString(`</table>
+	rootPageCounterHead = `</table>
     <h2>Counter Metrics</h2>
     <table>
-        <tr><th>Name</th><th>Value</th></tr>`)
+        <tr><th>Name</th><th>Value</th></tr>`
 
-	if len(counters) == 0 {
-		html.WriteString(`<tr><td colspan="2">No counter metrics</td></tr>`)
+	rootPageTail = `</table>
+</body>
+</html>`
+
+	rootPageNoGauges   = `<tr><td colspan="2">No gauge metrics</td></tr>`
+	rootPageNoCounters = `<tr><td colspan="2">No counter metrics</td></tr>`
+
+	rootPageRowGaugeOpen = `<tr><td>`
+	rootPageRowMid       = `</td><td>`
+	rootPageRowClose     = `</td></tr>`
+)
+
+// rootPageSize оценивает длину HTML-страницы, чтобы собрать её без
+// многократного роста буфера.
+func rootPageSize(gauges, counters int) int {
+	const (
+		headerSize  = len(rootPageGaugeHead) + len(rootPageCounterHead) + len(rootPageTail)
+		rowOverhead = len(rootPageRowGaugeOpen) + len(rootPageRowMid) + len(rootPageRowClose)
+		nameSize    = 24
+		valueSize   = 16
+	)
+	return headerSize + (gauges+counters)*(rowOverhead+nameSize+valueSize)
+}
+
+func (h *Handler) RootHandler(w http.ResponseWriter, r *http.Request) {
+	gauges, counters := h.storage.GetAllMetrics()
+
+	buf := make([]byte, 0, rootPageSize(len(gauges), len(counters)))
+
+	buf = append(buf, rootPageGaugeHead...)
+	if len(gauges) == 0 {
+		buf = append(buf, rootPageNoGauges...)
 	} else {
-		for name, value := range counters {
-			fmt.Fprintf(&html, `<tr><td>%s</td><td>%d</td></tr>`, name, value)
+		for name, value := range gauges {
+			buf = append(buf, rootPageRowGaugeOpen...)
+			buf = append(buf, name...)
+			buf = append(buf, rootPageRowMid...)
+			buf = strconv.AppendFloat(buf, value, 'g', -1, 64)
+			buf = append(buf, rootPageRowClose...)
 		}
 	}
 
-	html.WriteString(`</table>
-</body>
-</html>`)
+	buf = append(buf, rootPageCounterHead...)
+	if len(counters) == 0 {
+		buf = append(buf, rootPageNoCounters...)
+	} else {
+		for name, value := range counters {
+			buf = append(buf, rootPageRowGaugeOpen...)
+			buf = append(buf, name...)
+			buf = append(buf, rootPageRowMid...)
+			buf = strconv.AppendInt(buf, value, 10)
+			buf = append(buf, rootPageRowClose...)
+		}
+	}
+
+	buf = append(buf, rootPageTail...)
 
 	w.Header().Set("Content-Type", "text/html")
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(html.String()))
+	_, _ = w.Write(buf)
 }
 
 type loggingResponseWriter struct {
@@ -251,27 +286,29 @@ func (h *Handler) LoggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 
-		// Читаем и восстанавливаем тело запроса
+		// Читаем и восстанавливаем тело запроса. Копию тела нельзя
+		// возвращать в sync.Pool: net/http дочитывает r.Body уже после
+		// возврата из хендлера.
 		var bodyBytes []byte
 		if r.Body != nil {
 			bodyBytes, _ = io.ReadAll(r.Body)
-			r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 		}
 
 		lrw := &loggingResponseWriter{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(lrw, r)
 		duration := time.Since(start)
 
-		// Логгируем детали запроса и ответа
+		// Логгируем детали запроса и ответа. Bytes (в отличие от
+		// Str(string(body))) не создаёт промежуточную строку-копию тела.
 		log.Info().
 			Str("uri", r.RequestURI).
 			Str("method", r.Method).
 			Str("duration", duration.String()).
 			Int("status", lrw.status).
-			Interface("req_headers", map[string][]string{
-				"Content-Type": r.Header["Content-Type"], "Content-Encoding": r.Header["Content-Encoding"],
-			}).
-			Str("req_body_raw", string(bodyBytes)).
+			Strs("req_content_type", r.Header.Values("Content-Type")).
+			Strs("req_content_encoding", r.Header.Values("Content-Encoding")).
+			Bytes("req_body_raw", bodyBytes).
 			Msg("HTTP request processed")
 	})
 }
@@ -385,14 +422,32 @@ func (cw *compressWriter) Write(b []byte) (int, error) {
 	return cw.w.Write(b)
 }
 
+// gzipWriterPool переиспользует gzip.Writer: создание нового writer'а
+// требует ~600 КБ на словари и состояние deflate, а на каждый ответ
+// создавался новый экземпляр.
+var gzipWriterPool = sync.Pool{
+	New: func() any {
+		w, _ := gzip.NewWriterLevel(io.Discard, gzip.BestSpeed)
+		return w
+	},
+}
+
+// gzipReaderPool переиспользует gzip.Reader для входящих сжатых запросов.
+var gzipReaderPool = sync.Pool{
+	New: func() any {
+		return &gzip.Reader{}
+	},
+}
+
 type compressReader struct {
 	r  io.ReadCloser
 	zr *gzip.Reader
 }
 
 func newCompressReader(r io.ReadCloser) (*compressReader, error) {
-	zr, err := gzip.NewReader(r)
-	if err != nil {
+	zr := gzipReaderPool.Get().(*gzip.Reader)
+	if err := zr.Reset(r); err != nil {
+		gzipReaderPool.Put(zr)
 		return nil, err
 	}
 	return &compressReader{r: r, zr: zr}, nil
@@ -403,11 +458,20 @@ func (cr compressReader) Read(p []byte) (n int, err error) {
 }
 
 func (cr *compressReader) Close() error {
-	if err := cr.r.Close(); err != nil {
-		return err
+	if cr.zr == nil {
+		return cr.r.Close()
 	}
-	return cr.zr.Close()
+	errRead := cr.r.Close()
+	errGzip := cr.zr.Close()
+	gzipReaderPool.Put(cr.zr)
+	cr.zr = nil
+
+	if errRead != nil {
+		return errRead
+	}
+	return errGzip
 }
+
 func (h *Handler) GzipMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ow := w
@@ -416,12 +480,13 @@ func (h *Handler) GzipMiddleware(next http.Handler) http.Handler {
 		supportsGzip := strings.Contains(acceptEncoding, "gzip")
 
 		if supportsGzip {
-			gz, err := gzip.NewWriterLevel(w, gzip.BestSpeed)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			defer gz.Close()
+			gz := gzipWriterPool.Get().(*gzip.Writer)
+			gz.Reset(w)
+
+			defer func() {
+				_ = gz.Close()
+				gzipWriterPool.Put(gz)
+			}()
 
 			ow = &compressWriter{ResponseWriter: w, w: gz}
 		}
