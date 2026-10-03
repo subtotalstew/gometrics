@@ -11,14 +11,21 @@ import (
 	"github.com/jackc/pgconn"
 	"github.com/jackc/pgerrcode"
 	"github.com/rs/zerolog/log"
+
 	models "github.com/subtotalstew/gometrics.git/internal/model"
 	"github.com/subtotalstew/gometrics.git/internal/retry"
 )
 
+// DBStorage — хранилище метрик в PostgreSQL. Все операции записи и чтения
+// выполняются через retry.Do, поэтому временные ошибки соединения
+// (например, обрыв связи) не приводят к потере метрики.
 type DBStorage struct {
 	db *sql.DB
 }
 
+// NewDBStorage открывает соединение с PostgreSQL по DSN, проверяет его
+// через Ping и применяет миграции из каталога migrationsPath.
+// Возвращает ошибку, если подключиться или накатить миграции не удалось.
 func NewDBStorage(dsn string, migrationsPath string) (*DBStorage, error) {
 	log.Info().Msg("подключение к базе данных PostgreSQL")
 
@@ -76,11 +83,14 @@ func (s *DBStorage) DB() *sql.DB {
 	return s.db
 }
 
+// Close закрывает соединение с базой данных.
 func (s *DBStorage) Close() error {
 	log.Info().Msg("закрываем соединение с базой данных")
 	return s.db.Close()
 }
 
+// SetGauge записывает значение gauge-метрики в таблицу gauges
+// (INSERT ... ON CONFLICT DO UPDATE).
 func (s *DBStorage) SetGauge(name string, value float64) error {
 	return retry.Do("db_set_gauge", func() error {
 		_, err := s.db.Exec(`
@@ -92,6 +102,8 @@ func (s *DBStorage) SetGauge(name string, value float64) error {
 	}, isRetriablePgError)
 }
 
+// UpdateCounter прибавляет value к counter-метрике в таблице counters
+// (атомарно на стороне БД: delta = counters.delta + EXCLUDED.delta).
 func (s *DBStorage) UpdateCounter(name string, value int64) error {
 	return retry.Do("db_update_counter", func() error {
 		_, err := s.db.Exec(`
@@ -103,6 +115,8 @@ func (s *DBStorage) UpdateCounter(name string, value int64) error {
 	}, isRetriablePgError)
 }
 
+// GetGauge читает gauge-метрику из БД. Если метрики нет или запрос
+// завершился ошибкой, возвращает (0, false).
 func (s *DBStorage) GetGauge(name string) (float64, bool) {
 	var value float64
 
@@ -116,6 +130,8 @@ func (s *DBStorage) GetGauge(name string) (float64, bool) {
 	return value, true
 }
 
+// GetCounter читает counter-метрику из БД. Если метрики нет или запрос
+// завершился ошибкой, возвращает (0, false).
 func (s *DBStorage) GetCounter(name string) (int64, bool) {
 	var delta int64
 
@@ -129,6 +145,9 @@ func (s *DBStorage) GetCounter(name string) (int64, bool) {
 	return delta, true
 }
 
+// GetAllMetrics читает все gauge- и counter-метрики двумя запросами.
+// Ошибки чтения логируются, но не прерывают обход: возвращается то,
+// что удалось прочитать.
 func (s *DBStorage) GetAllMetrics() (map[string]float64, map[string]int64) {
 	gauges := make(map[string]float64)
 	counters := make(map[string]int64)
@@ -174,6 +193,10 @@ func (s *DBStorage) GetAllMetrics() (map[string]float64, map[string]int64) {
 	return gauges, counters
 }
 
+// UpdateBatch применяет набор метрик в одной транзакции: сначала готовятся
+// statements для gauges и counters, затем все метрики записываются и
+// транзакция коммитится. Пустой срез — успешная no-op. Метрики с
+// nil-значением пропускаются.
 func (s *DBStorage) UpdateBatch(metrics []models.Metrics) error {
 	if len(metrics) == 0 {
 		return nil

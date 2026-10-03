@@ -12,7 +12,10 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	_ "github.com/lib/pq"
 	"github.com/rs/zerolog/log"
+
+	"github.com/subtotalstew/gometrics.git/internal/audit"
 	"github.com/subtotalstew/gometrics.git/internal/handler"
+	"github.com/subtotalstew/gometrics.git/internal/profiler"
 	"github.com/subtotalstew/gometrics.git/internal/storage"
 )
 
@@ -25,6 +28,9 @@ func main() {
 		restore       bool
 		databaseDSN   string
 		key           string
+		auditFile     string
+		auditURL      string
+		pprofAddr     string
 	)
 
 	flag.StringVar(&addr, "a", "localhost:8080", "address and port to run server, format: <hostname>:<port>")
@@ -33,6 +39,9 @@ func main() {
 	flag.BoolVar(&restore, "r", true, "whether to restore previously saved metrics on start")
 	flag.StringVar(&databaseDSN, "d", "", "database connection string")
 	flag.StringVar(&key, "k", "", "key for decrypt")
+	flag.StringVar(&auditFile, "audit-file", "", "path to audit log file")
+	flag.StringVar(&auditURL, "audit-url", "", "URL for audit log delivery")
+	flag.StringVar(&pprofAddr, "pprof-addr", "", "address of the pprof/debug HTTP server (empty = disabled)")
 
 	flag.Parse()
 
@@ -59,12 +68,29 @@ func main() {
 	if envDSN := os.Getenv("DATABASE_DSN"); envDSN != "" {
 		databaseDSN = envDSN
 	}
-
 	if envKey := os.Getenv("KEY"); envKey != "" {
 		key = envKey
 	}
-
+	if envAuditFile := os.Getenv("AUDIT_FILE"); envAuditFile != "" {
+		auditFile = envAuditFile
+	}
+	if envAuditURL := os.Getenv("AUDIT_URL"); envAuditURL != "" {
+		auditURL = envAuditURL
+	}
+	if envPprofAddr := os.Getenv("PPROF_ADDR"); envPprofAddr != "" {
+		pprofAddr = envPprofAddr
+	}
 	log.Info().Msgf("Starting server on %s", addr)
+
+	var pprofSrv *http.Server
+	if pprofAddr != "" {
+		var err error
+		pprofSrv, err = profiler.Start(pprofAddr)
+		if err != nil {
+			log.Fatal().Err(err).Msg("не удалось запустить pprof-сервер")
+		}
+		log.Info().Str("addr", pprofSrv.Addr).Msg("pprof-сервер запущен")
+	}
 
 	var (
 		metricsStorage storage.Storage
@@ -98,6 +124,17 @@ func main() {
 	}
 
 	h := handler.NewHandler(metricsStorage)
+
+	auditSubject := audit.NewSubject()
+	if auditFile != "" {
+		auditSubject.Register(audit.NewFileObserver(auditFile))
+		log.Info().Str("file", auditFile).Msg("аудит: включён файловый приёмник")
+	}
+	if auditURL != "" {
+		auditSubject.Register(audit.NewURLObserver(auditURL))
+		log.Info().Str("url", auditURL).Msg("аудит: включён удалённый приёмник")
+	}
+	h.SetAudit(auditSubject)
 
 	if dbStorage != nil {
 		h.SetDB(dbStorage.DB())
@@ -178,6 +215,10 @@ func main() {
 
 	if dbStorage != nil {
 		_ = dbStorage.Close()
+	}
+
+	if pprofSrv != nil {
+		_ = pprofSrv.Close()
 	}
 
 	_ = srv.Close()

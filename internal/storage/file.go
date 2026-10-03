@@ -7,9 +7,14 @@ import (
 	"time"
 
 	"github.com/rs/zerolog/log"
+
 	models "github.com/subtotalstew/gometrics.git/internal/model"
 )
 
+// SaveToFile сохраняет все метрики из хранилища s в файл path в формате
+// JSON ([]models.Metrics). Запись идёт через временный файл с последующим
+// переименованием, поэтому прерывание процесса не портит существующий файл.
+// При необходимости создаёт каталоги назначения.
 func SaveToFile(s Storage, path string) error {
 	gauges, counters := s.GetAllMetrics()
 
@@ -51,6 +56,9 @@ func SaveToFile(s Storage, path string) error {
 	return os.Rename(tmp, path)
 }
 
+// LoadFromFile восстанавливает метрики из файла path в хранилище s:
+// gauge-метрики записываются, counter-метрики прибавляются. Отсутствие файла
+// не считается ошибкой — это обычная ситуация при первом запуске.
 func LoadFromFile(s Storage, path string) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -87,6 +95,9 @@ func LoadFromFile(s Storage, path string) error {
 	return nil
 }
 
+// RunPeriodicSave запускает фоновое сохранение метрик в файл каждые interval
+// секунд и блокирует горутину до закрытия канала stop. При interval <= 0
+// функция сразу возвращает управление (сохранение выключено).
 func RunPeriodicSave(s Storage, path string, interval int, stop <-chan struct{}) {
 	if interval <= 0 {
 		return
