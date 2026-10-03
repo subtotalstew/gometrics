@@ -49,12 +49,14 @@ func newServer() *httptest.Server {
 	return httptest.NewServer(r)
 }
 
-// do выполняет запрос к серверу примера и возвращает ответ. Ошибки
-// транспортного уровня паникуют: в примере они означают ошибку самого
-// примера, а не проверяемое поведение сервиса.
+// do выполняет запрос к серверу примера. Ошибки транспортного уровня
+// паникуют: в примере они означают ошибку самого примера, а не проверяемое
+// поведение сервиса.
 //
 // Заголовок Accept-Encoding: identity отключает автоматическое
 // разжатие gzip в http.Transport, чтобы примеры читали тело ответа «как есть».
+//
+// Тело ответа закрывает вызывающий код — closeBody или readBody.
 func do(req *http.Request) *http.Response {
 	if req.Header.Get("Accept-Encoding") == "" {
 		req.Header.Set("Accept-Encoding", "identity")
@@ -66,21 +68,36 @@ func do(req *http.Request) *http.Response {
 	return resp
 }
 
+// closeBody закрывает тело ответа, когда содержимое не нужно.
+func closeBody(resp *http.Response) {
+	if err := resp.Body.Close(); err != nil {
+		panic(err)
+	}
+}
+
 // readBody вычитывает тело ответа целиком, чтобы соединение вернулось
-// в пул HTTP-клиента.
+// в пул HTTP-клиента, и закрывает его.
 func readBody(resp *http.Response) string {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		panic(err)
 	}
-	resp.Body.Close()
+	closeBody(resp)
 	return string(body)
 }
 
-// readGzipBody разжимает тело сжатого ответа сервиса и читает его целиком.
+// readGzipBody разжимает тело сжатого ответа сервиса (Content-Encoding: gzip),
+// читает его целиком и закрывает ответ.
 func readGzipBody(resp *http.Response) string {
 	zr := must(gzip.NewReader(resp.Body))
-	return readBody(&http.Response{Body: io.NopCloser(zr)})
+	defer zr.Close()
+
+	body, err := io.ReadAll(zr)
+	if err != nil {
+		panic(err)
+	}
+	closeBody(resp)
+	return string(body)
 }
 
 // Example: сохранение метрики «по пути».
@@ -95,12 +112,12 @@ func Example_practicalTrack_updatePath() {
 	// gauge: записать текущую температуру.
 	resp := do(must(http.NewRequest(http.MethodPost, srv.URL+"/update/gauge/temperature/42.5", nil)))
 	fmt.Println("gauge:", resp.StatusCode)
-	resp.Body.Close()
+	closeBody(resp)
 
 	// counter: увеличить счётчик запросов на 7.
 	resp = do(must(http.NewRequest(http.MethodPost, srv.URL+"/update/counter/requests_total/7", nil)))
 	fmt.Println("counter:", resp.StatusCode)
-	resp.Body.Close()
+	closeBody(resp)
 
 	// Output:
 	// gauge: 200
@@ -140,9 +157,9 @@ func Example_practicalTrack_valuePath() {
 	defer srv.Close()
 
 	resp := do(must(http.NewRequest(http.MethodPost, srv.URL+"/update/gauge/temperature/42.5", nil)))
-	resp.Body.Close()
+	closeBody(resp)
 	resp = do(must(http.NewRequest(http.MethodPost, srv.URL+"/update/counter/requests_total/7", nil)))
-	resp.Body.Close()
+	closeBody(resp)
 
 	resp = do(must(http.NewRequest(http.MethodGet, srv.URL+"/value/gauge/temperature", nil)))
 	fmt.Println("gauge:", readBody(resp))
@@ -164,7 +181,7 @@ func Example_practicalTrack_valueJSON() {
 	defer srv.Close()
 
 	resp := do(must(http.NewRequest(http.MethodPost, srv.URL+"/update/gauge/temperature/42.5", nil)))
-	resp.Body.Close()
+	closeBody(resp)
 
 	query, _ := json.Marshal(models.Metrics{ID: "temperature", MType: models.Gauge})
 	req := must(http.NewRequest(http.MethodPost, srv.URL+"/value", bytes.NewReader(query)))
@@ -180,6 +197,7 @@ func Example_practicalTrack_valueJSON() {
 
 	resp = do(req)
 	fmt.Println("unknown:", resp.StatusCode)
+	closeBody(resp)
 
 	// Output:
 	// status: 200
@@ -207,7 +225,7 @@ func Example_practicalTrack_updatesBatch() {
 	req.Header.Set("Content-Type", "application/json")
 	resp := do(req)
 	fmt.Println("batch:", resp.StatusCode)
-	resp.Body.Close()
+	closeBody(resp)
 
 	resp = do(must(http.NewRequest(http.MethodGet, srv.URL+"/value/gauge/Alloc", nil)))
 	fmt.Println("Alloc:", readBody(resp))
@@ -242,7 +260,7 @@ func Example_practicalTrack_updatesBatchGzip() {
 	req.Header.Set("Content-Encoding", "gzip")
 	resp := do(req)
 	fmt.Println("compressed request:", resp.StatusCode)
-	resp.Body.Close()
+	closeBody(resp)
 
 	query, _ := json.Marshal(models.Metrics{ID: "Alloc", MType: models.Gauge})
 	req = must(http.NewRequest(http.MethodPost, srv.URL+"/value", bytes.NewReader(query)))
@@ -295,7 +313,7 @@ func Example_practicalTrack_hashMiddleware() {
 
 	resp = do(req)
 	fmt.Println("wrong hash:", resp.StatusCode)
-	resp.Body.Close()
+	closeBody(resp)
 
 	// Output:
 	// signed: 200
@@ -311,9 +329,9 @@ func Example_practicalTrack_rootPage() {
 	defer srv.Close()
 
 	resp := do(must(http.NewRequest(http.MethodPost, srv.URL+"/update/gauge/temperature/42.5", nil)))
-	resp.Body.Close()
+	closeBody(resp)
 	resp = do(must(http.NewRequest(http.MethodPost, srv.URL+"/update/counter/requests_total/7", nil)))
-	resp.Body.Close()
+	closeBody(resp)
 
 	resp = do(must(http.NewRequest(http.MethodGet, srv.URL+"/", nil)))
 	page := readBody(resp)
@@ -344,7 +362,7 @@ func Example_practicalTrack_ping() {
 
 	resp := do(must(http.NewRequest(http.MethodGet, srv.URL+"/ping", nil)))
 	fmt.Println("without db:", resp.StatusCode)
-	resp.Body.Close()
+	closeBody(resp)
 
 	// Output:
 	// without db: 500
@@ -370,7 +388,7 @@ func Example_practicalTrack_audit() {
 	defer srv.Close()
 
 	resp := do(must(http.NewRequest(http.MethodPost, srv.URL+"/update/gauge/temperature/42.5", nil)))
-	resp.Body.Close()
+	closeBody(resp)
 
 	event := <-events
 	fmt.Println("metrics:", event.Metrics)

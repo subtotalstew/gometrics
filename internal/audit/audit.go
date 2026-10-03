@@ -16,8 +16,8 @@ import (
 
 // Event — событие аудита: какие метрики изменили и с какого IP.
 type Event struct {
-	// Ts — время события в формате Unix.
-	Ts int64 `json:"ts"`
+	// TS — время события в формате Unix.
+	TS int64 `json:"ts"`
 	// Metrics — имена изменённых метрик.
 	Metrics []string `json:"metrics"`
 	// IPAddress — IP клиента, отправившего изменение.
@@ -71,7 +71,7 @@ func (s *Subject) Notify(event Event) {
 // NewEvent создаёт событие с текущим временем, списком метрик и IP клиента.
 func NewEvent(metrics []string, ip string) Event {
 	return Event{
-		Ts:        time.Now().Unix(),
+		TS:        time.Now().Unix(),
 		Metrics:   metrics,
 		IPAddress: ip,
 	}
