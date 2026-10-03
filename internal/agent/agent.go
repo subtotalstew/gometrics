@@ -1,3 +1,5 @@
+// Package agent собирает метрики рантайма и системы (gopsutil) и отправляет
+// их на сервер метрик батчами через POST /updates/ (gzip + подпись HMAC).
 package agent
 
 import (
@@ -46,12 +48,16 @@ func compressGzip(dst *bytes.Buffer, data []byte) error {
 	return gz.Close()
 }
 
+// Collector накапливает метрики в памяти: gauge — текущие значения
+// рантайма и системы, counter — число циклов опроса (PollCount).
+// Безопасен для конкурентного использования.
 type Collector struct {
 	mu      sync.Mutex
 	gauge   map[string]float64
 	counter map[string]int64
 }
 
+// NewCollector создаёт пустой сборщик метрик.
 func NewCollector() *Collector {
 	return &Collector{
 		gauge:   make(map[string]float64),
@@ -59,6 +65,9 @@ func NewCollector() *Collector {
 	}
 }
 
+// UpdateMetrics считывает метрики рантайма Go (runtime.MemStats), пишет их
+// в gauge-метрики и увеличивает счётчик PollCount на единицу.
+// Дополнительно заполняется случайная метрика RandomValue.
 func (c *Collector) UpdateMetrics() {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
@@ -97,6 +106,10 @@ func (c *Collector) UpdateMetrics() {
 	c.counter["PollCount"]++
 }
 
+// UpdatePSUtilMetrics добавляет системные метрики через gopsutil:
+// TotalMemory, FreeMemory и CPUutilization<N> по каждому ядру.
+// Ошибка означает, что часть метрик не собрана; ранее собранные
+// значения при этом не затираются.
 func (c *Collector) UpdatePSUtilMetrics() error {
 	vm, err := mem.VirtualMemory()
 	if err != nil {
@@ -121,6 +134,7 @@ func (c *Collector) UpdatePSUtilMetrics() error {
 	return nil
 }
 
+// GetGauge возвращает копию текущих gauge-метрик.
 func (c *Collector) GetGauge() map[string]float64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -131,6 +145,7 @@ func (c *Collector) GetGauge() map[string]float64 {
 	return result
 }
 
+// GetCounter возвращает копию текущих counter-метрик.
 func (c *Collector) GetCounter() map[string]int64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -141,6 +156,8 @@ func (c *Collector) GetCounter() map[string]int64 {
 	return result
 }
 
+// Agent собирает метрики по расписанию и отправляет их на сервер метрик
+// пулом воркеров. Один Agent соответствует одному запущенному процессу агента.
 type Agent struct {
 	mu             sync.RWMutex
 	collector      *Collector
@@ -152,6 +169,11 @@ type Agent struct {
 	client         *http.Client
 }
 
+// NewAgent создаёт агент, который опрашивает метрики каждые pollInterval
+// секунд, отправляет их каждые reportInterval секунд и делает не более
+// rateLimit одновременных исходящих запросов. serverAddr указывается
+// с схемой, например http://localhost:8080.
+// Пустой key отключает подпись HashSHA256; rateLimit <= 0 трактуется как 1.
 func NewAgent(serverAddr string, pollInterval, reportInterval, rateLimit int, key string) *Agent {
 	if rateLimit <= 0 {
 		rateLimit = 1
@@ -167,6 +189,10 @@ func NewAgent(serverAddr string, pollInterval, reportInterval, rateLimit int, ke
 	}
 }
 
+// Run запускает агент и блокируется до получения SIGINT/SIGTERM.
+// Внутри поднимаются три горутины-поллера (runtime, gopsutil, отправка)
+// и пул из rateLimit воркеров; при завершении они останавливаются
+// по контексту, а очередь отправки закрывается.
 func (a *Agent) Run() {
 	log.Info().
 		Int("poll_interval", a.pollInterval).

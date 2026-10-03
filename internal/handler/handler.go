@@ -1,3 +1,15 @@
+// Package handler содержит HTTP-хендлеры сервиса метрик, middleware
+// (gzip, логирование, подпись HMAC-SHA256) и маршрутизацию этих хендлеров.
+//
+// Эндпоинты сервиса:
+//
+//	POST /update/{type}/{name}/{value} — записать метрику (путь);
+//	GET  /value/{type}/{name}          — прочитать метрику (путь);
+//	POST /update                       — записать метрику (JSON);
+//	POST /value                        — прочитать метрику (JSON);
+//	POST /updates/                     — записать батч метрик (JSON, gzip);
+//	GET  /                             — HTML-страница со всеми метриками;
+//	GET  /ping                         — проверка соединения с БД.
 package handler
 
 import (
@@ -25,6 +37,10 @@ import (
 	"github.com/subtotalstew/gometrics.git/internal/storage"
 )
 
+// Handler обслуживает HTTP-запросы сервиса метрик. Он хранит ссылку на
+// хранилище, необязательные зависимости (колбэк синхронного сохранения,
+// соединение с БД, ключ подписи, издатель аудита) и не содержит
+// изменяемого состояния после настройки.
 type Handler struct {
 	storage  storage.Storage
 	syncSave func()
@@ -33,14 +49,20 @@ type Handler struct {
 	audit    *audit.Subject
 }
 
+// SetKey задаёт ключ подписи HMAC-SHA256. Пока ключ не задан,
+// HashMiddleware пропускает запросы без проверки подписи.
 func (h *Handler) SetKey(key string) {
 	h.key = key
 }
 
+// NewHandler создаёт хендлер поверх указанного хранилища метрик.
 func NewHandler(storage storage.Storage) *Handler {
 	return &Handler{storage: storage}
 }
 
+// SetSyncSave задаёт колбэк, который вызывается сразу после успешного
+// изменения метрик. Используется для синхронного сохранения на диск
+// (интервал сохранения 0); при nil метрики не сохраняются.
 func (h *Handler) SetSyncSave(fn func()) {
 	h.syncSave = fn
 }
@@ -51,6 +73,9 @@ func (h *Handler) trySyncSave() {
 	}
 }
 
+// SetAudit задаёт издателя событий аудита. После этого каждое успешное
+// изменение метрик (кроме /updates/) порождает событие аудита.
+// При nil аудит отключён.
 func (h *Handler) SetAudit(subject *audit.Subject) {
 	h.audit = subject
 }
@@ -80,10 +105,14 @@ func (h *Handler) notifyAudit(r *http.Request, metricNames []string) {
 	h.audit.Notify(audit.NewEvent(metricNames, clientIP(r)))
 }
 
+// SetDB задаёт соединение с базой данных, которое проверяет PingHandler.
+// Вызывается только когда сервис запущен с хранилищем PostgreSQL.
 func (h *Handler) SetDB(db *sql.DB) {
 	h.db = db
 }
 
+// PingHandler обрабатывает GET /ping. Возвращает 200, если соединение с БД
+// живо, и 500, если БД не сконфигурирована или не отвечает в течение 3 секунд.
 func (h *Handler) PingHandler(w http.ResponseWriter, r *http.Request) {
 	if h.db == nil {
 		http.Error(w, "database not configured", http.StatusInternalServerError)
@@ -101,6 +130,12 @@ func (h *Handler) PingHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+// UpdateHandler обрабатывает POST /update/{type}/{name}/{value}.
+// metricType — gauge или counter, value — число в текстовом виде.
+//
+// Коды ответа: 200 — метрика записана, 400 — неизвестный тип или
+// неразбираемое значение, 404 — пустое имя метрики, 405 — метод не POST,
+// 500 — ошибка хранилища.
 func (h *Handler) UpdateHandler(w http.ResponseWriter, r *http.Request) {
 
 	metricType := chi.URLParam(r, "type")
@@ -151,6 +186,9 @@ func (h *Handler) UpdateHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// ValueHandler обрабатывает GET /value/{type}/{name} и отдаёт значение
+// метрики в текстовом виде: для gauge — формат %g, для counter — десятичное
+// целое. Коды ответа: 200, 400 — неизвестный тип, 404 — метрика не найдена.
 func (h *Handler) ValueHandler(w http.ResponseWriter, r *http.Request) {
 	metricType := chi.URLParam(r, "type")
 	metricName := chi.URLParam(r, "name")
@@ -225,6 +263,9 @@ func rootPageSize(gauges, counters int) int {
 	return headerSize + (gauges+counters)*(rowOverhead+nameSize+valueSize)
 }
 
+// RootHandler обрабатывает GET / и возвращает HTML-страницу со всеми
+// gauge- и counter-метриками. Страница собирается в один буфер заранее
+// оцененного размера (без strings.Builder и fmt).
 func (h *Handler) RootHandler(w http.ResponseWriter, r *http.Request) {
 	gauges, counters := h.storage.GetAllMetrics()
 
@@ -283,6 +324,10 @@ func (lrw *loggingResponseWriter) Write(b []byte) (int, error) {
 	return size, err
 }
 
+// LoggingMiddleware логирует каждый обработанный запрос: URI, метод,
+// длительность, код ответа, заголовки Content-Type/Content-Encoding
+// и сырое тело запроса. Тело читается целиком и восстанавливается
+// через io.NopCloser, чтобы его увидел следующий хендлер.
 func (h *Handler) LoggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -314,6 +359,12 @@ func (h *Handler) LoggingMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// ValueJSONHandler обрабатывает POST /value: в теле — models.Metrics
+// с заполненными id и type, в ответ приходят актуальные value/delta.
+//
+// Обязателен заголовок Content-Type: application/json. Коды ответа:
+// 200, 400 — некорректный JSON/пустое имя/неизвестный тип,
+// 404 — метрика не найдена, 415 — неподдерживаемый Content-Type.
 func (h *Handler) ValueJSONHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
@@ -359,6 +410,14 @@ func (h *Handler) ValueJSONHandler(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(req)
 }
 
+// UpdateJSONHandler обрабатывает POST /update: в теле — models.Metrics
+// с заполненными id, type и value (для gauge) либо delta (для counter).
+// Ответ повторяет метрику, для counter в delta возвращается накопленное
+// значение счётчика.
+//
+// Обязателен заголовок Content-Type: application/json. Коды ответа:
+// 200, 400 — некорректный JSON/пустое имя/неизвестный тип/нет значения,
+// 415 — неподдерживаемый Content-Type, 500 — ошибка хранилища.
 func (h *Handler) UpdateJSONHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
@@ -473,6 +532,10 @@ func (cr *compressReader) Close() error {
 	return errGzip
 }
 
+// GzipMiddleware сжимает ответы (Content-Type: application/json или
+// text/html) и разжимает тело запроса, если пришёл Content-Encoding: gzip.
+// Писатели и читатели gzip берутся из sync.Pool, потому что создание
+// нового gzip.Writer стоит сотни килобайт аллокаций.
 func (h *Handler) GzipMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ow := w
@@ -534,6 +597,13 @@ func (ctw *contentTypeCheckWriter) WriteHeader(statusCode int) {
 	ctw.ResponseWriter.WriteHeader(statusCode)
 }
 
+// UpdatesJSONHandler обрабатывает POST /updates/ — батч метрик
+// (JSON-массив models.Metrics), обычно сжатый gzip.
+//
+// Весь батч валидируется до записи: при ошибке в любой метрике не
+// записывается ни одна. Коды ответа: 200 (в том числе для пустого батча),
+// 400 — некорректный JSON или метрика без значения нужного типа,
+// 500 — ошибка хранилища.
 func (h *Handler) UpdatesJSONHandler(w http.ResponseWriter, r *http.Request) {
 	var metrics []models.Metrics
 
@@ -576,6 +646,12 @@ func (h *Handler) UpdatesJSONHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+// HashMiddleware проверяет подпись HMAC-SHA256 тела запроса из заголовка
+// HashSHA256 и подписывает тело ответа тем же заголовком. Если ключ не
+// задан (SetKey не вызывался), middleware ничего не делает.
+//
+// Несовпадение подписи — 400. Тело запроса читается целиком и
+// восстанавливается для следующего хендлера.
 func (h *Handler) HashMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if h.key == "" {

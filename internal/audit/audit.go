@@ -1,3 +1,6 @@
+// Package audit реализует аудит изменений метрик по шаблону
+// «наблюдатель»: Subject хранит список приёмников, а каждый приёмник
+// (файл, внешний HTTP-сервис) получает событие с именем метрики и IP клиента.
 package audit
 
 import (
@@ -11,27 +14,36 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+// Event — событие аудита: какие метрики изменили и с какого IP.
 type Event struct {
-	Ts        int64    `json:"ts"`
-	Metrics   []string `json:"metrics"`
-	IPAddress string   `json:"ip_address"`
+	// Ts — время события в формате Unix.
+	Ts int64 `json:"ts"`
+	// Metrics — имена изменённых метрик.
+	Metrics []string `json:"metrics"`
+	// IPAddress — IP клиента, отправившего изменение.
+	IPAddress string `json:"ip_address"`
 }
 
-// Observer
+// Observer — приёмник событий аудита. Реализации: FileObserver, URLObserver.
 type Observer interface {
+	// Notify обрабатывает событие. Ошибка не останавливает остальные
+	// приёмники — Subject её только логирует.
 	Notify(event Event) error
 }
 
-// Subject
+// Subject — издатель событий аудита, который рассылает событие всем
+// зарегистрированным Observer. Безопасен для конкурентного использования.
 type Subject struct {
 	mu        sync.RWMutex
 	observers []Observer
 }
 
+// NewSubject создаёт издателя без приёмников.
 func NewSubject() *Subject {
 	return &Subject{}
 }
 
+// Register добавляет приёмник в список. nil игнорируется.
 func (s *Subject) Register(o Observer) {
 	if o == nil {
 		return
@@ -41,6 +53,8 @@ func (s *Subject) Register(o Observer) {
 	s.observers = append(s.observers, o)
 }
 
+// Notify рассылает событие всем зарегистрированным приёмникам.
+// Ошибки приёмников логируются и не прерывают рассылку.
 func (s *Subject) Notify(event Event) {
 	s.mu.RLock()
 	observers := make([]Observer, len(s.observers))
@@ -54,6 +68,7 @@ func (s *Subject) Notify(event Event) {
 	}
 }
 
+// NewEvent создаёт событие с текущим временем, списком метрик и IP клиента.
 func NewEvent(metrics []string, ip string) Event {
 	return Event{
 		Ts:        time.Now().Unix(),
@@ -62,15 +77,21 @@ func NewEvent(metrics []string, ip string) Event {
 	}
 }
 
+// FileObserver записывает события аудита в файл: по одному JSON-объекту
+// на строку (JSON Lines).
 type FileObserver struct {
 	path string
 	mu   sync.Mutex
 }
 
+// NewFileObserver создаёт приёмник, пишущий в файл path. Файл создаётся
+// при первой записи, если его нет.
 func NewFileObserver(path string) *FileObserver {
 	return &FileObserver{path: path}
 }
 
+// Notify дописывает событие в конец файла. Записи сериализованы мьютексом,
+// поэтому событие не может «разорваться» между двумя горутинами.
 func (f *FileObserver) Notify(event Event) error {
 	data, err := json.Marshal(event)
 	if err != nil {
@@ -91,11 +112,14 @@ func (f *FileObserver) Notify(event Event) error {
 	return err
 }
 
+// URLObserver отправляет события аудита POST-запросом на внешний сервис.
 type URLObserver struct {
 	url    string
 	client *http.Client
 }
 
+// NewURLObserver создаёт приёмник, отправляющий события на url.
+// HTTP-клиент имеет таймаут 5 секунд.
 func NewURLObserver(url string) *URLObserver {
 	return &URLObserver{
 		url:    url,
@@ -103,6 +127,9 @@ func NewURLObserver(url string) *URLObserver {
 	}
 }
 
+// Notify отправляет событие как JSON с Content-Type application/json.
+// Ошибки транспорта возвращаются вызывающему, а ответы сервера аудита
+// с кодом 5xx только логируются: событие считается доставленным.
 func (u *URLObserver) Notify(event Event) error {
 	data, err := json.Marshal(event)
 	if err != nil {
