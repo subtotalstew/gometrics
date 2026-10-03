@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog/log"
+
 	models "github.com/subtotalstew/gometrics.git/internal/model"
 )
 
