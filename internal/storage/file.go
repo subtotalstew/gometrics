@@ -8,7 +8,7 @@ import (
 
 	"github.com/rs/zerolog/log"
 
-	models "github.com/subtotalstew/gometrics.git/internal/model"
+	"github.com/subtotalstew/gometrics.git/internal/models"
 )
 
 // SaveToFile сохраняет все метрики из хранилища s в файл path в формате

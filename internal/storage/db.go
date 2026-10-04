@@ -12,7 +12,7 @@ import (
 	"github.com/jackc/pgerrcode"
 	"github.com/rs/zerolog/log"
 
-	models "github.com/subtotalstew/gometrics.git/internal/model"
+	"github.com/subtotalstew/gometrics.git/internal/models"
 	"github.com/subtotalstew/gometrics.git/internal/retry"
 )
 

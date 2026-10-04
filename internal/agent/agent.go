@@ -23,7 +23,7 @@ import (
 	"github.com/shirou/gopsutil/v3/mem"
 
 	"github.com/subtotalstew/gometrics.git/internal/hash"
-	models "github.com/subtotalstew/gometrics.git/internal/model"
+	"github.com/subtotalstew/gometrics.git/internal/models"
 	"github.com/subtotalstew/gometrics.git/internal/retry"
 )
 

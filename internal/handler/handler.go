@@ -33,7 +33,7 @@ import (
 
 	"github.com/subtotalstew/gometrics.git/internal/audit"
 	"github.com/subtotalstew/gometrics.git/internal/hash"
-	models "github.com/subtotalstew/gometrics.git/internal/model"
+	"github.com/subtotalstew/gometrics.git/internal/models"
 	"github.com/subtotalstew/gometrics.git/internal/storage"
 )
 
@@ -74,8 +74,10 @@ func (h *Handler) trySyncSave() {
 }
 
 // SetAudit задаёт издателя событий аудита. После этого каждое успешное
-// изменение метрик (кроме /updates/) порождает событие аудита.
-// При nil аудит отключён.
+// изменение метрик — и поштучно (/update, /update/{type}/{name}/{value}),
+// и батчем (/updates/) — порождает событие аудита. При nil аудит отключён, и
+// события не создаются вовсе. Вызывающий код владеет издателем и должен
+// закрыть его (audit.Subject.Close) при остановке сервиса.
 func (h *Handler) SetAudit(subject *audit.Subject) {
 	h.audit = subject
 }
@@ -98,11 +100,15 @@ func clientIP(r *http.Request) string {
 	return host
 }
 
+// notifyAudit публикует событие аудита об изменённых метриках. Доставка
+// асинхронная (см. audit.Subject), поэтому имена метрик копируются: срез
+// принадлежит обработке запроса и после возврата может быть переиспользован.
 func (h *Handler) notifyAudit(r *http.Request, metricNames []string) {
 	if h.audit == nil || len(metricNames) == 0 {
 		return
 	}
-	h.audit.Notify(audit.NewEvent(metricNames, clientIP(r)))
+	event := audit.NewEvent(metricNames, clientIP(r))
+	h.audit.Notify(audit.WithNames(event))
 }
 
 // SetDB задаёт соединение с базой данных, которое проверяет PingHandler.

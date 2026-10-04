@@ -27,7 +27,7 @@ import (
 	"github.com/subtotalstew/gometrics.git/internal/audit"
 	"github.com/subtotalstew/gometrics.git/internal/handler"
 	"github.com/subtotalstew/gometrics.git/internal/hash"
-	models "github.com/subtotalstew/gometrics.git/internal/model"
+	"github.com/subtotalstew/gometrics.git/internal/models"
 	"github.com/subtotalstew/gometrics.git/internal/storage"
 )
 

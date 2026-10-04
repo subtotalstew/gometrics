@@ -6,7 +6,7 @@ import (
 	"maps"
 	"sync"
 
-	models "github.com/subtotalstew/gometrics.git/internal/model"
+	"github.com/subtotalstew/gometrics.git/internal/models"
 )
 
 // MemStorage — потокобезопасное хранилище метрик в оперативной памяти.

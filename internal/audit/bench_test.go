@@ -25,6 +25,7 @@ func BenchmarkNewEvent(b *testing.B) {
 
 func BenchmarkSubjectNotify_TwoObservers(b *testing.B) {
 	s := NewSubject()
+	b.Cleanup(func() { _ = s.Close() })
 	s.Register(discardObserver{})
 	s.Register(discardObserver{})
 	event := benchEvent()
@@ -39,6 +40,7 @@ func BenchmarkSubjectNotify_TwoObservers(b *testing.B) {
 func BenchmarkFileObserverNotify(b *testing.B) {
 	path := filepath.Join(b.TempDir(), "audit.log")
 	obs := NewFileObserver(path)
+	b.Cleanup(func() { _ = obs.Close() })
 	event := benchEvent()
 
 	// Прогреваем файл, чтобы измерять именно append, а не создание.

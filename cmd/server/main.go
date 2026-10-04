@@ -125,16 +125,29 @@ func main() {
 
 	h := handler.NewHandler(metricsStorage)
 
-	auditSubject := audit.NewSubject()
-	if auditFile != "" {
-		auditSubject.Register(audit.NewFileObserver(auditFile))
-		log.Info().Str("file", auditFile).Msg("аудит: включён файловый приёмник")
+	// Аудит включается, только если задан хотя бы один приёмник: при пустых
+	// -audit-file и -audit-url хендлер не знает об аудите и событий не создаёт.
+	var auditSubject *audit.Subject
+	if auditFile != "" || auditURL != "" {
+		auditSubject = audit.NewSubject()
+		defer func() {
+			// Закрываем после остановки сервера: Close дожидается
+			// доставки событий, накопленных в очереди.
+			if err := auditSubject.Close(); err != nil {
+				log.Error().Err(err).Msg("не удалось корректно закрыть аудит")
+			}
+		}()
+
+		if auditFile != "" {
+			auditSubject.Register(audit.NewFileObserver(auditFile))
+			log.Info().Str("file", auditFile).Msg("аудит: включён файловый приёмник")
+		}
+		if auditURL != "" {
+			auditSubject.Register(audit.NewURLObserver(auditURL))
+			log.Info().Str("url", auditURL).Msg("аудит: включён удалённый приёмник")
+		}
+		h.SetAudit(auditSubject)
 	}
-	if auditURL != "" {
-		auditSubject.Register(audit.NewURLObserver(auditURL))
-		log.Info().Str("url", auditURL).Msg("аудит: включён удалённый приёмник")
-	}
-	h.SetAudit(auditSubject)
 
 	if dbStorage != nil {
 		h.SetDB(dbStorage.DB())

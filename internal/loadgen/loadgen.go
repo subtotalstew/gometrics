@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"github.com/subtotalstew/gometrics.git/internal/hash"
-	models "github.com/subtotalstew/gometrics.git/internal/model"
+	"github.com/subtotalstew/gometrics.git/internal/models"
 )
 
 // Config описывает параметры нагрузки.
