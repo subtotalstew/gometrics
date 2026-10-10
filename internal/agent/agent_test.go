@@ -244,3 +244,30 @@ func TestAgent_Run_GracefulShutdown(t *testing.T) {
 		t.Fatal("Agent.Run did not stop after SIGINT")
 	}
 }
+
+func TestCollector_Reset(t *testing.T) {
+	t.Parallel()
+
+	c := NewCollector()
+	c.UpdateMetrics()
+	c.UpdatePSUtilMetrics()
+
+	if len(c.GetGauge()) == 0 {
+		t.Fatal("gauge should not be empty before reset")
+	}
+	if len(c.GetCounter()) == 0 {
+		t.Fatal("counter should not be empty before reset")
+	}
+
+	c.Reset()
+
+	if got := len(c.GetGauge()); got != 0 {
+		t.Errorf("after Reset: gauge len = %d, want 0", got)
+	}
+	if got := len(c.GetCounter()); got != 0 {
+		t.Errorf("after Reset: counter len = %d, want 0", got)
+	}
+
+	var nilCollector *Collector
+	nilCollector.Reset() // не должно паниковать
+}
