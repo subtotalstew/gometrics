@@ -382,9 +382,7 @@ func (a *Agent) sendMetricsBatch(metrics []models.Metrics) {
 		return nil
 	}
 
-	err = retry.Do("send_metrics_batch", sendOnce, func(err error) bool {
-		return isRetriableHTTPError(err)
-	})
+	err = retry.Do("send_metrics_batch", sendOnce, isRetriableHTTPError)
 
 	if err != nil {
 		log.Error().Err(err).Int("count", len(metrics)).Msg("failed to send metrics batch after retries")

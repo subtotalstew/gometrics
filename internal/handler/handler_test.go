@@ -565,3 +565,22 @@ func TestClientIP(t *testing.T) {
 		})
 	}
 }
+func TestHandler_SetDB(t *testing.T) {
+	t.Parallel()
+	h := NewHandler(storage.NewMemStorage())
+	h.SetDB(nil)
+}
+
+func TestHandler_SetSyncSave(t *testing.T) {
+	t.Parallel()
+
+	h := NewHandler(storage.NewMemStorage())
+
+	called := false
+	h.SetSyncSave(func() { called = true })
+
+	// SetSyncSave должен только сохранить callback, но не вызывать его.
+	if called {
+		t.Error("SetSyncSave invoked callback during registration")
+	}
+}
