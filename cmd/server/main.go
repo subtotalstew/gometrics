@@ -29,6 +29,12 @@ import (
 	"github.com/subtotalstew/gometrics.git/internal/storage"
 )
 
+var (
+	buildVersion string
+	buildDate    string
+	buildCommit  string
+)
+
 // config — параметры запуска сервера.
 type config struct {
 	addr          string
@@ -43,9 +49,24 @@ type config struct {
 }
 
 func main() {
+	printBuildInfo()
+
 	if err := run(); err != nil {
 		log.Error().Err(err).Msg("server stopped with error")
 	}
+}
+
+func printBuildInfo() {
+	fmt.Printf("Build version: %s\n", orNA(buildVersion))
+	fmt.Printf("Build date: %s\n", orNA(buildDate))
+	fmt.Printf("Build commit: %s\n", orNA(buildCommit))
+}
+
+func orNA(s string) string {
+	if s == "" {
+		return "N/A"
+	}
+	return s
 }
 
 // run загружает конфигурацию, собирает зависимости, запускает сервер
