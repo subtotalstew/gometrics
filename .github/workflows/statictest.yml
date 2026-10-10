@@ -12,21 +12,13 @@ jobs:
     container: golang:1.27
     steps:
       - name: Checkout code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
-      - name: Download statictest binary
-        uses: robinraju/release-downloader@v1.8
-        with:
-          repository: Yandex-Practicum/go-autotests
-          latest: true
-          fileName: statictest
-          out-file-path: .tools
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Setup autotest binary
+      - name: Build statictest
         run: |
-          chmod -R +x $GITHUB_WORKSPACE/.tools/statictest
-          mv $GITHUB_WORKSPACE/.tools/statictest /usr/local/bin/statictest
+          git clone --depth 1 https://github.com/Yandex-Practicum/go-autotests.git /tmp/go-autotests
+          cd /tmp/go-autotests
+          go build -o /usr/local/bin/statictest ./cmd/statictest
 
       - name: Run statictest
         run: |
