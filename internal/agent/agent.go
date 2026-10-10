@@ -51,6 +51,8 @@ func compressGzip(dst *bytes.Buffer, data []byte) error {
 // Collector накапливает метрики в памяти: gauge — текущие значения
 // рантайма и системы, counter — число циклов опроса (PollCount).
 // Безопасен для конкурентного использования.
+//
+// generate:reset
 type Collector struct {
 	mu      sync.Mutex
 	gauge   map[string]float64
