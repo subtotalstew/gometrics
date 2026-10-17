@@ -28,30 +28,25 @@ type config struct {
 }
 
 var (
-	buildVersion string
-	buildDate    string
-	buildCommit  string
+	buildVersion = "N/A"
+	buildDate    = "N/A"
+	buildCommit  = "N/A"
 )
 
 // main не вызывает os.Exit и не вызывает log.Fatal*, чтобы удовлетворять
 // анализатору noosexit.
 func main() {
+	printBuildInfo()
+
 	if err := run(); err != nil {
 		log.Printf("agent: %v", err)
 	}
 }
 
 func printBuildInfo() {
-	fmt.Printf("Build version: %s\n", orNA(buildVersion))
-	fmt.Printf("Build date: %s\n", orNA(buildDate))
-	fmt.Printf("Build commit: %s\n", orNA(buildCommit))
-}
-
-func orNA(s string) string {
-	if s == "" {
-		return "N/A"
-	}
-	return s
+	fmt.Printf("Build version: %s\n", buildVersion)
+	fmt.Printf("Build date: %s\n", buildDate)
+	fmt.Printf("Build commit: %s\n", buildCommit)
 }
 
 // run парсит конфигурацию, создаёт и запускает агент.

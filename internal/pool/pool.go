@@ -21,17 +21,31 @@ type Pool[T resetter] struct {
 }
 
 // New создаёт и возвращает указатель на Pool.
+//
+// newFn вызывается лениво, когда пул пуст. Если newFn == nil,
+// поведение совпадает с sync.Pool без инициализатора: Get() на пустом
+// пуле возвращает zero-value типа T (для указательного T — nil).
 func New[T resetter](newFn func() T) *Pool[T] {
-	return &Pool[T]{
-		pool: &sync.Pool{
-			New: func() any { return newFn() },
-		},
+	p := &Pool[T]{pool: &sync.Pool{}}
+	if newFn != nil {
+		p.pool.New = func() any { return newFn() }
 	}
+	return p
 }
 
 // Get возвращает объект из пула.
+//
+// Если пул пуст и newFn в New был nil, возвращается zero-value T
+// (nil для указательных типов). Для значимых T это означает, что
+// вернётся zero-value структуры, и Put на ней вызовет Reset() —
+// это нормально, если Reset корректно работает на zero-value.
 func (p *Pool[T]) Get() T {
-	return p.pool.Get().(T)
+	v := p.pool.Get()
+	if v == nil {
+		var zero T
+		return zero
+	}
+	return v.(T)
 }
 
 // Put возвращает объект в пул, предварительно вызывая Reset().

@@ -2,11 +2,15 @@
 
 package agent
 
+// Reset сбрасывает Collector к начальному состоянию.
 func (x *Collector) Reset() {
 	if x == nil {
 		return
 	}
 
+	// gauge
 	clear(x.gauge)
+
+	// counter
 	clear(x.counter)
 }

@@ -87,3 +87,51 @@ func TestPool_Concurrent(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestPool_NewNil_GetReturnsNil(t *testing.T) {
+	t.Parallel()
+
+	// newFn == nil: поведение как у sync.Pool без New.
+	p := New[*item](nil)
+	if p == nil {
+		t.Fatal("New(nil) returned nil Pool")
+	}
+
+	// Get на пустом пуле не должен паниковать и должен вернуть nil.
+	got := p.Get()
+	if got != nil {
+		t.Errorf("Get() with nil newFn = %v, want nil", got)
+	}
+
+	// Повторный Get тоже nil.
+	got2 := p.Get()
+	if got2 != nil {
+		t.Errorf("second Get() with nil newFn = %v, want nil", got2)
+	}
+}
+
+func TestPool_NewNil_PutThenGet(t *testing.T) {
+	t.Parallel()
+
+	// newFn == nil, но Put работает: объект попадает в пул и возвращается.
+	p := New[*item](nil)
+
+	v := &item{value: 42, data: []int{1, 2, 3}}
+	p.Put(v)
+
+	got := p.Get()
+	if got == nil {
+		t.Fatal("Get() after Put with nil newFn returned nil")
+	}
+	if got.value != 0 {
+		t.Errorf("after reuse: value = %d, want 0 (Reset should run)", got.value)
+	}
+	if len(got.data) != 0 {
+		t.Errorf("after reuse: data len = %d, want 0 (Reset should run)", len(got.data))
+	}
+
+	// После того как пул опустел, снова Get → nil.
+	if extra := p.Get(); extra != nil {
+		t.Errorf("Get() on empty pool = %v, want nil", extra)
+	}
+}
