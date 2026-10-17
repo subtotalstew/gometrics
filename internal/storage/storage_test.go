@@ -1,7 +1,12 @@
 package storage
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/subtotalstew/gometrics.git/internal/models"
 )
 
 func TestNewMemStorage(t *testing.T) {
@@ -79,5 +84,85 @@ func TestUpdateCounter(t *testing.T) {
 				t.Errorf("GetCounter() = %v, want %v", got, tt.expected)
 			}
 		})
+	}
+}
+
+func TestMemStorage_UpdateBatch(t *testing.T) {
+	t.Parallel()
+
+	s := NewMemStorage()
+
+	g1 := 1.5
+	g2 := 2.5
+	c1 := int64(10)
+	c2 := int64(20)
+
+	batch := []models.Metrics{
+		{ID: "g1", MType: models.Gauge, Value: &g1},
+		{ID: "g2", MType: models.Gauge, Value: &g2},
+		{ID: "c1", MType: models.Counter, Delta: &c1},
+		{ID: "c2", MType: models.Counter, Delta: &c2},
+	}
+	s.UpdateBatch(batch)
+
+	// Gauge-метрики записались.
+	if got, ok := s.GetGauge("g1"); !ok || got != g1 {
+		t.Errorf("gauge g1 = (%v, %v), want (%v, true)", got, ok, g1)
+	}
+	if got, ok := s.GetGauge("g2"); !ok || got != g2 {
+		t.Errorf("gauge g2 = (%v, %v), want (%v, true)", got, ok, g2)
+	}
+
+	// Counter-метрики прибавились.
+	if got, ok := s.GetCounter("c1"); !ok || got != c1 {
+		t.Errorf("counter c1 = (%v, %v), want (%v, true)", got, ok, c1)
+	}
+	if got, ok := s.GetCounter("c2"); !ok || got != c2 {
+		t.Errorf("counter c2 = (%v, %v), want (%v, true)", got, ok, c2)
+	}
+
+	// Повторный вызов: counter-метрики должны удвоиться, gauge — перезаписаться.
+	s.UpdateBatch(batch)
+	if got, _ := s.GetCounter("c1"); got != c1*2 {
+		t.Errorf("after second batch: counter c1 = %v, want %v", got, c1*2)
+	}
+	if got, _ := s.GetCounter("c2"); got != c2*2 {
+		t.Errorf("after second batch: counter c2 = %v, want %v", got, c2*2)
+	}
+}
+
+func TestRunPeriodicSave(t *testing.T) {
+	// Не t.Parallel() — тест спит ~1 секунду, чтобы не тормозить остальные.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "metrics.json")
+
+	s := NewMemStorage()
+	if err := s.SetGauge("g1", 1.5); err != nil {
+		t.Fatalf("SetGauge: %v", err)
+	}
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		RunPeriodicSave(s, path, 1, stop)
+	}()
+
+	// interval = 1 секунда, значит первый тик — через 1 секунду.
+	// Ждём с запасом 1.5 секунды.
+	time.Sleep(1500 * time.Millisecond)
+	close(stop)
+	<-done
+
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("file not created: %v", err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if len(data) == 0 {
+		t.Error("file is empty")
 	}
 }

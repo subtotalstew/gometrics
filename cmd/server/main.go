@@ -1,12 +1,22 @@
+// Command server запускает HTTP-сервер метрик.
+//
+// main не вызывает os.Exit напрямую (это запрещено анализатором noosexit);
+// вся работа делегируется run(), а ошибка логируется через log.Print.
+// Такое разделение заодно делает сервер тестируемым: run, loadConfigFrom
+// и buildRouter можно вызывать из тестов без запуска процесса.
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
+	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
 	"syscall"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -19,169 +29,127 @@ import (
 	"github.com/subtotalstew/gometrics.git/internal/storage"
 )
 
+var (
+	buildVersion = "N/A"
+	buildDate    = "N/A"
+	buildCommit  = "N/A"
+)
+
+// config — параметры запуска сервера.
+type config struct {
+	addr          string
+	storeInterval int
+	filePath      string
+	restore       bool
+	databaseDSN   string
+	key           string
+	auditFile     string
+	auditURL      string
+	pprofAddr     string
+}
+
 func main() {
+	printBuildInfo()
 
-	var (
-		addr          string
-		storeInterval int
-		filePath      string
-		restore       bool
-		databaseDSN   string
-		key           string
-		auditFile     string
-		auditURL      string
-		pprofAddr     string
-	)
-
-	flag.StringVar(&addr, "a", "localhost:8080", "address and port to run server, format: <hostname>:<port>")
-	flag.IntVar(&storeInterval, "i", 300, "interval in seconds to persist metrics to disk (0 = synchronous save)")
-	flag.StringVar(&filePath, "f", "metrics-store.json", "path to file for persisting metrics")
-	flag.BoolVar(&restore, "r", true, "whether to restore previously saved metrics on start")
-	flag.StringVar(&databaseDSN, "d", "", "database connection string")
-	flag.StringVar(&key, "k", "", "key for decrypt")
-	flag.StringVar(&auditFile, "audit-file", "", "path to audit log file")
-	flag.StringVar(&auditURL, "audit-url", "", "URL for audit log delivery")
-	flag.StringVar(&pprofAddr, "pprof-addr", "", "address of the pprof/debug HTTP server (empty = disabled)")
-
-	flag.Parse()
-
-	if envAddr := os.Getenv("ADDRESS"); envAddr != "" {
-		addr = envAddr
+	if err := run(); err != nil {
+		log.Error().Err(err).Msg("server stopped with error")
 	}
-	if envInterval := os.Getenv("STORE_INTERVAL"); envInterval != "" {
-		val, err := strconv.Atoi(envInterval)
+}
+
+func printBuildInfo() {
+	fmt.Printf("Build version: %s\n", buildVersion)
+	fmt.Printf("Build date: %s\n", buildDate)
+	fmt.Printf("Build commit: %s\n", buildCommit)
+}
+
+// run загружает конфигурацию, собирает зависимости, запускает сервер
+// и блокируется до получения SIGINT/SIGTERM.
+func run() error {
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	return serve(cfg)
+}
+
+// loadConfig парсит флаги и переменные окружения в проде.
+func loadConfig() (config, error) {
+	fs := flag.NewFlagSet("server", flag.ContinueOnError)
+	return loadConfigFrom(fs)
+}
+
+// loadConfigFromArgs — как loadConfig, но создаёт свежий FlagSet.
+// Нужна для тестов, чтобы не переиспользовать глобальный flag.CommandLine.
+func loadConfigFromArgs() (config, error) {
+	fs := flag.NewFlagSet("server", flag.ContinueOnError)
+	return loadConfigFrom(fs)
+}
+
+// loadConfigFrom — общая логика парсинга флагов и env.
+func loadConfigFrom(fs *flag.FlagSet) (config, error) {
+	cfg := config{}
+
+	fs.StringVar(&cfg.addr, "a", "localhost:8080", "address and port to run server, format: <hostname>:<port>")
+	fs.IntVar(&cfg.storeInterval, "i", 300, "interval in seconds to persist metrics to disk (0 = synchronous save)")
+	fs.StringVar(&cfg.filePath, "f", "metrics-store.json", "path to file for persisting metrics")
+	fs.BoolVar(&cfg.restore, "r", true, "whether to restore previously saved metrics on start")
+	fs.StringVar(&cfg.databaseDSN, "d", "", "database connection string")
+	fs.StringVar(&cfg.key, "k", "", "key for decrypt")
+	fs.StringVar(&cfg.auditFile, "audit-file", "", "path to audit log file")
+	fs.StringVar(&cfg.auditURL, "audit-url", "", "URL for audit log delivery")
+	fs.StringVar(&cfg.pprofAddr, "pprof-addr", "", "address of the pprof/debug HTTP server (empty = disabled)")
+
+	if err := fs.Parse(os.Args[1:]); err != nil {
+		return config{}, err
+	}
+
+	if v := os.Getenv("ADDRESS"); v != "" {
+		cfg.addr = v
+	}
+	if v := os.Getenv("STORE_INTERVAL"); v != "" {
+		n, err := strconv.Atoi(v)
 		if err != nil {
-			log.Fatal().Err(err).Msg("неверный формат STORE_INTERVAL")
+			return config{}, fmt.Errorf("неверный формат STORE_INTERVAL: %w", err)
 		}
-		storeInterval = val
+		cfg.storeInterval = n
 	}
-	if envFile := os.Getenv("FILE_STORAGE_PATH"); envFile != "" {
-		filePath = envFile
+	if v := os.Getenv("FILE_STORAGE_PATH"); v != "" {
+		cfg.filePath = v
 	}
-	if envRestore := os.Getenv("RESTORE"); envRestore != "" {
-		val, err := strconv.ParseBool(envRestore)
+	if v := os.Getenv("RESTORE"); v != "" {
+		b, err := strconv.ParseBool(v)
 		if err != nil {
-			log.Fatal().Err(err).Msg("неверный формат RESTORE")
+			return config{}, fmt.Errorf("неверный формат RESTORE: %w", err)
 		}
-		restore = val
+		cfg.restore = b
 	}
-	if envDSN := os.Getenv("DATABASE_DSN"); envDSN != "" {
-		databaseDSN = envDSN
+	if v := os.Getenv("DATABASE_DSN"); v != "" {
+		cfg.databaseDSN = v
 	}
-	if envKey := os.Getenv("KEY"); envKey != "" {
-		key = envKey
+	if v := os.Getenv("KEY"); v != "" {
+		cfg.key = v
 	}
-	if envAuditFile := os.Getenv("AUDIT_FILE"); envAuditFile != "" {
-		auditFile = envAuditFile
+	if v := os.Getenv("AUDIT_FILE"); v != "" {
+		cfg.auditFile = v
 	}
-	if envAuditURL := os.Getenv("AUDIT_URL"); envAuditURL != "" {
-		auditURL = envAuditURL
+	if v := os.Getenv("AUDIT_URL"); v != "" {
+		cfg.auditURL = v
 	}
-	if envPprofAddr := os.Getenv("PPROF_ADDR"); envPprofAddr != "" {
-		pprofAddr = envPprofAddr
+	if v := os.Getenv("PPROF_ADDR"); v != "" {
+		cfg.pprofAddr = v
 	}
-	log.Info().Msgf("Starting server on %s", addr)
+	return cfg, nil
+}
 
-	var pprofSrv *http.Server
-	if pprofAddr != "" {
-		var err error
-		pprofSrv, err = profiler.Start(pprofAddr)
-		if err != nil {
-			log.Fatal().Err(err).Msg("не удалось запустить pprof-сервер")
-		}
-		log.Info().Str("addr", pprofSrv.Addr).Msg("pprof-сервер запущен")
-	}
-
-	var (
-		metricsStorage storage.Storage
-		dbStorage      *storage.DBStorage
-	)
-
-	switch {
-	case databaseDSN != "":
-		var err error
-		dbStorage, err = storage.NewDBStorage(databaseDSN, "migrations")
-		if err != nil {
-			log.Fatal().Err(err).Msg("не удалось инициализировать хранилище PostgreSQL")
-		}
-		metricsStorage = dbStorage
-		log.Info().Msg("используется хранилище: PostgreSQL")
-
-	default:
-		mem := storage.NewMemStorage()
-		metricsStorage = mem
-
-		if filePath != "" {
-			log.Info().Msg("используется хранилище: файл (с бэкапом в память)")
-			if restore {
-				if err := storage.LoadFromFile(mem, filePath); err != nil {
-					log.Error().Err(err).Msg("не удалось восстановить метрики из файла")
-				}
-			}
-		} else {
-			log.Info().Msg("используется хранилище: память")
-		}
-	}
-
-	h := handler.NewHandler(metricsStorage)
-
-	// Аудит включается, только если задан хотя бы один приёмник: при пустых
-	// -audit-file и -audit-url хендлер не знает об аудите и событий не создаёт.
-	var auditSubject *audit.Subject
-	if auditFile != "" || auditURL != "" {
-		auditSubject = audit.NewSubject()
-		defer func() {
-			// Закрываем после остановки сервера: Close дожидается
-			// доставки событий, накопленных в очереди.
-			if err := auditSubject.Close(); err != nil {
-				log.Error().Err(err).Msg("не удалось корректно закрыть аудит")
-			}
-		}()
-
-		if auditFile != "" {
-			auditSubject.Register(audit.NewFileObserver(auditFile))
-			log.Info().Str("file", auditFile).Msg("аудит: включён файловый приёмник")
-		}
-		if auditURL != "" {
-			auditSubject.Register(audit.NewURLObserver(auditURL))
-			log.Info().Str("url", auditURL).Msg("аудит: включён удалённый приёмник")
-		}
-		h.SetAudit(auditSubject)
-	}
-
-	if dbStorage != nil {
-		h.SetDB(dbStorage.DB())
-	}
-
-	var stop chan struct{}
-	var done chan struct{}
-
-	if databaseDSN == "" && filePath != "" {
-		if memStorage, ok := metricsStorage.(*storage.MemStorage); ok {
-			if storeInterval == 0 {
-				h.SetSyncSave(func() {
-					if err := storage.SaveToFile(memStorage, filePath); err != nil {
-						log.Error().Err(err).Msg("не удалось синхронно сохранить метрики")
-					}
-				})
-			} else {
-				stop = make(chan struct{})
-				done = make(chan struct{})
-				go func() {
-					defer close(done)
-					storage.RunPeriodicSave(memStorage, filePath, storeInterval, stop)
-				}()
-			}
-		}
-	}
-
+// buildRouter собирает chi-роутер с полным стеком middleware.
+// Вынесено из serve(), чтобы тестировать маршрутизацию без запуска сервера.
+func buildRouter(h *handler.Handler, key string) *chi.Mux {
 	r := chi.NewRouter()
 
 	if key != "" {
 		h.SetKey(key)
 		r.Use(h.HashMiddleware)
 	}
-
 	r.Use(h.GzipMiddleware)
 	r.Use(h.LoggingMiddleware)
 	r.Use(middleware.Recoverer)
@@ -199,11 +167,109 @@ func main() {
 	r.Post("/updates", h.UpdatesJSONHandler)
 	r.Post("/updates/", h.UpdatesJSONHandler)
 
-	srv := &http.Server{Addr: addr, Handler: r}
+	return r
+}
+
+// serve — вся оркестрация: pprof, хранилище, аудит, роутер, сервер, сигналы.
+func serve(cfg config) error {
+	log.Info().Msgf("Starting server on %s", cfg.addr)
+
+	var pprofSrv *http.Server
+	if cfg.pprofAddr != "" {
+		var err error
+		pprofSrv, err = profiler.Start(cfg.pprofAddr)
+		if err != nil {
+			return fmt.Errorf("не удалось запустить pprof-сервер: %w", err)
+		}
+		defer func() { _ = pprofSrv.Close() }()
+		log.Info().Str("addr", pprofSrv.Addr).Msg("pprof-сервер запущен")
+	}
+
+	var (
+		metricsStorage storage.Storage
+		dbStorage      *storage.DBStorage
+	)
+
+	switch {
+	case cfg.databaseDSN != "":
+		var err error
+		dbStorage, err = storage.NewDBStorage(cfg.databaseDSN, "migrations")
+		if err != nil {
+			return fmt.Errorf("не удалось инициализировать хранилище PostgreSQL: %w", err)
+		}
+		defer func() { _ = dbStorage.Close() }()
+		metricsStorage = dbStorage
+		log.Info().Msg("используется хранилище: PostgreSQL")
+
+	default:
+		mem := storage.NewMemStorage()
+		metricsStorage = mem
+
+		if cfg.filePath != "" {
+			log.Info().Msg("используется хранилище: файл (с бэкапом в память)")
+			if cfg.restore {
+				if err := storage.LoadFromFile(mem, cfg.filePath); err != nil {
+					log.Error().Err(err).Msg("не удалось восстановить метрики из файла")
+				}
+			}
+		} else {
+			log.Info().Msg("используется хранилище: память")
+		}
+	}
+
+	h := handler.NewHandler(metricsStorage)
+
+	// Аудит включается, только если задан хотя бы один приёмник.
+	if cfg.auditFile != "" || cfg.auditURL != "" {
+		auditSubject := audit.NewSubject()
+		defer func() {
+			if err := auditSubject.Close(); err != nil {
+				log.Error().Err(err).Msg("не удалось корректно закрыть аудит")
+			}
+		}()
+
+		if cfg.auditFile != "" {
+			auditSubject.Register(audit.NewFileObserver(cfg.auditFile))
+			log.Info().Str("file", cfg.auditFile).Msg("аудит: включён файловый приёмник")
+		}
+		if cfg.auditURL != "" {
+			auditSubject.Register(audit.NewURLObserver(cfg.auditURL))
+			log.Info().Str("url", cfg.auditURL).Msg("аудит: включён удалённый приёмник")
+		}
+		h.SetAudit(auditSubject)
+	}
+
+	if dbStorage != nil {
+		h.SetDB(dbStorage.DB())
+	}
+
+	var stop, done chan struct{}
+
+	if cfg.databaseDSN == "" && cfg.filePath != "" {
+		if memStorage, ok := metricsStorage.(*storage.MemStorage); ok {
+			if cfg.storeInterval == 0 {
+				h.SetSyncSave(func() {
+					if err := storage.SaveToFile(memStorage, cfg.filePath); err != nil {
+						log.Error().Err(err).Msg("не удалось синхронно сохранить метрики")
+					}
+				})
+			} else {
+				stop = make(chan struct{})
+				done = make(chan struct{})
+				go func() {
+					defer close(done)
+					storage.RunPeriodicSave(memStorage, cfg.filePath, cfg.storeInterval, stop)
+				}()
+			}
+		}
+	}
+
+	r := buildRouter(h, cfg.key)
+	srv := &http.Server{Addr: cfg.addr, Handler: r}
 
 	go func() {
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatal().Msg(err.Error())
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Error().Err(err).Msg("HTTP-сервер завершился с ошибкой")
 		}
 	}()
 
@@ -218,21 +284,17 @@ func main() {
 		<-done
 	}
 
-	if databaseDSN == "" && filePath != "" {
+	if cfg.databaseDSN == "" && cfg.filePath != "" {
 		if memStorage, ok := metricsStorage.(*storage.MemStorage); ok {
-			if err := storage.SaveToFile(memStorage, filePath); err != nil {
+			if err := storage.SaveToFile(memStorage, cfg.filePath); err != nil {
 				log.Error().Err(err).Msg("не удалось сохранить метрики при завершении работы")
 			}
 		}
 	}
 
-	if dbStorage != nil {
-		_ = dbStorage.Close()
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = srv.Shutdown(ctx)
 
-	if pprofSrv != nil {
-		_ = pprofSrv.Close()
-	}
-
-	_ = srv.Close()
+	return nil
 }

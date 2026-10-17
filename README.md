@@ -5,6 +5,7 @@
 запросу. Поддерживаются сжатие gzip, подпись HMAC-SHA256 и аудит.
 
 - [Запуск](#запуск)
+- [Сборка с версией](#сборка-с-версией)
 - [Тесты и покрытие](#тесты-и-покрытие)
 - [Бенчмарки](#бенчмарки)
 - [Профилирование памяти (pprof)](#профилирование-памяти-pprof)
@@ -22,6 +23,93 @@ go run ./cmd/server -a=localhost:8080 -f= -i=300 -pprof-addr=localhost:6060
 # агент
 go run ./cmd/agent -a=localhost:8080 -p=2 -r=10
 ```
+
+## Сборка с версией
+
+Переменные `buildVersion`, `buildDate`, `buildCommit` заполняются линкером
+через `-ldflags -X` при сборке. Если при сборке их не передать, в выводе
+будет `N/A`.
+
+### Сборка сервера
+
+```bash
+go build \
+  -ldflags "\
+    -X main.buildVersion=1.0.0 \
+    -X main.buildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+    -X main.buildCommit=$(git rev-parse --short HEAD)" \
+  -o bin/server ./cmd/server
+```
+
+### Сборка агента
+
+```bash
+go build \
+  -ldflags "\
+    -X main.buildVersion=1.0.0 \
+    -X main.buildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+    -X main.buildCommit=$(git rev-parse --short HEAD)" \
+  -o bin/agent ./cmd/agent
+```
+
+### Windows (cmd.exe)
+
+```bat
+for /f %%i in ('git rev-parse --short HEAD') do set COMMIT=%%i
+for /f "tokens=1-3 delims=- " %%a in ('powershell -NoProfile -Command "Get-Date -Format yyyy-MM-dd"') do set DATE=%%a-%%b-%%c
+
+go build -ldflags "-X main.buildVersion=1.0.0 -X main.buildDate=%DATE% -X main.buildCommit=%COMMIT%" -o bin\server.exe .\cmd\server
+go build -ldflags "-X main.buildVersion=1.0.0 -X main.buildDate=%DATE% -X main.buildCommit=%COMMIT%" -o bin\agent.exe  .\cmd\agent
+```
+
+### Проверка
+
+```
+$ ./bin/server -h
+Build version: 1.0.0
+Build date: 2026-10-17T12:34:56Z
+Build commit: a1b2c3d
+Usage of server:
+  ...
+```
+
+Если собрать без `-ldflags`:
+
+```
+$ go build -o bin/server ./cmd/server
+$ ./bin/server -h
+Build version: N/A
+Build date: N/A
+Build commit: N/A
+Usage of server:
+  ...
+```
+
+### Переопределение через переменные окружения (для CI)
+
+В CI удобно не зашивать значения в команду, а передавать их из окружения:
+
+```bash
+VERSION="${VERSION:-dev}"
+COMMIT="${GITHUB_SHA::7}"
+DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+go build -ldflags "\
+  -X main.buildVersion=${VERSION} \
+  -X main.buildDate=${DATE} \
+  -X main.buildCommit=${COMMIT}" \
+  -o bin/server ./cmd/server
+```
+
+Если вы используете пакет `internal/buildinfo`, замените пути в `-X` на:
+
+```bash
+-X github.com/subtotalstew/gometrics.git/internal/buildinfo.Version=…
+-X github.com/subtotalstew/gometrics.git/internal/buildinfo.Date=…
+-X github.com/subtotalstew/gometrics.git/internal/buildinfo.Commit=…
+```
+
+Обратите внимание: `-X` работает только с **уже инициализированными строковыми литералами**. Если переменная объявлена через функцию (`var x = getVersion()`), значение из `-X` не подставится.
 
 ## Тесты и покрытие
 
