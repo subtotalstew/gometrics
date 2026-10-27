@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -60,12 +59,11 @@ func BenchmarkAgentEnqueueMetrics(b *testing.B) {
 	a.collector.UpdatePSUtilMetrics()
 
 	jobs := make(chan []models.Metrics, 1)
-	ctx := context.Background()
 
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		a.enqueueMetrics(ctx, jobs)
+		a.enqueueMetrics(jobs)
 		<-jobs
 	}
 }
@@ -81,7 +79,7 @@ func BenchmarkAgentSendMetricsBatch(b *testing.B) {
 	a.collector.UpdatePSUtilMetrics()
 
 	jobs := make(chan []models.Metrics, 1)
-	a.enqueueMetrics(context.Background(), jobs)
+	a.enqueueMetrics(jobs)
 	batch := <-jobs
 
 	b.ReportAllocs()

@@ -1,11 +1,13 @@
 // Package agent собирает метрики рантайма и системы (gopsutil) и отправляет
-// их на сервер метрик батчами через POST /updates/ (gzip + подпись HMAC).
+// их на сервер метрик батчами через POST /updates/ (gzip + подпись HMAC,
+// опционально асимметричное шифрование тела запроса).
 package agent
 
 import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/rsa"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -22,6 +24,7 @@ import (
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/mem"
 
+	"github.com/subtotalstew/gometrics.git/internal/crypto"
 	"github.com/subtotalstew/gometrics.git/internal/hash"
 	"github.com/subtotalstew/gometrics.git/internal/models"
 	"github.com/subtotalstew/gometrics.git/internal/retry"
@@ -168,6 +171,7 @@ type Agent struct {
 	reportInterval int
 	rateLimit      int
 	key            string
+	pubKey         *rsa.PublicKey
 	client         *http.Client
 }
 
@@ -176,6 +180,8 @@ type Agent struct {
 // rateLimit одновременных исходящих запросов. serverAddr указывается
 // с схемой, например http://localhost:8080.
 // Пустой key отключает подпись HashSHA256; rateLimit <= 0 трактуется как 1.
+//
+// Асимметричное шифрование включается отдельно методом SetCryptoKey.
 func NewAgent(serverAddr string, pollInterval, reportInterval, rateLimit int, key string) *Agent {
 	if rateLimit <= 0 {
 		rateLimit = 1
@@ -191,10 +197,35 @@ func NewAgent(serverAddr string, pollInterval, reportInterval, rateLimit int, ke
 	}
 }
 
-// Run запускает агент и блокируется до получения SIGINT/SIGTERM.
+// SetCryptoKey включает асимметричное шифрование тела запросов: публичный
+// ключ читается из файла по пути path. Пустой path оставляет шифрование
+// выключенным.
+//
+// Метод нужно вызывать до Run: ключ читается один раз на старте, а не на
+// каждом запросе, поэтому опечатка в пути видна сразу при запуске агента.
+func (a *Agent) SetCryptoKey(path string) error {
+	if path == "" {
+		a.pubKey = nil
+		return nil
+	}
+
+	pub, err := crypto.LoadPublicKey(path)
+	if err != nil {
+		return fmt.Errorf("agent: %w", err)
+	}
+	a.pubKey = pub
+	return nil
+}
+
+// Run запускает агент и блокируется до получения SIGINT, SIGTERM или SIGQUIT.
 // Внутри поднимаются три горутины-поллера (runtime, gopsutil, отправка)
 // и пул из rateLimit воркеров; при завершении они останавливаются
 // по контексту, а очередь отправки закрывается.
+//
+// По сигналу агент не теряет уже собранные данные: поллеры
+// останавливаются, последний снимок метрик досылается в очередь,
+// и только после того, как воркеры отработают все батчи (включая
+// повторы), Run возвращает управление.
 func (a *Agent) Run() {
 	log.Info().
 		Int("poll_interval", a.pollInterval).
@@ -206,7 +237,7 @@ func (a *Agent) Run() {
 	defer cancel()
 
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 
 	jobs := make(chan []models.Metrics, a.rateLimit)
 
@@ -227,12 +258,22 @@ func (a *Agent) Run() {
 	pollersWG.Add(1)
 	go a.runReporter(ctx, jobs, &pollersWG)
 
-	<-sigChan
-	log.Info().Msg("agent shutting down gracefully")
+	sig := <-sigChan
+	// Снимаем обработчик: повторный сигнал завершит процесс сразу,
+	// не дожидаясь, пока воркеры доработают повторы.
+	signal.Stop(sigChan)
+	log.Info().Str("signal", sig.String()).Msg("agent shutting down gracefully")
 
+	// 1. Останавливаем поллеры: новых снимков метрик больше не будет.
 	cancel()
 	pollersWG.Wait()
 
+	// 2. Досылаем последний снимок: данные, собранные между двумя
+	//    отчётами, иначе потерялись бы вместе с процессом.
+	a.enqueueMetrics(jobs)
+
+	// 3. Закрываем очередь: воркеры отправят всё уже поставленное
+	//    (с повторами при временных ошибках) и только потом завершатся.
 	close(jobs)
 	workersWG.Wait()
 
@@ -291,14 +332,17 @@ func (a *Agent) runReporter(ctx context.Context, jobs chan<- []models.Metrics, w
 	for {
 		select {
 		case <-ticker.C:
-			a.enqueueMetrics(ctx, jobs)
+			a.enqueueMetrics(jobs)
 		case <-ctx.Done():
 			return
 		}
 	}
 }
 
-func (a *Agent) enqueueMetrics(ctx context.Context, jobs chan<- []models.Metrics) {
+// enqueueMetrics ставит в очередь снимок текущих метрик. Отправка в jobs
+// не прерывается контекстом: воркеры живут до close(jobs), поэтому батч,
+// сформированный в момент получения сигнала, всегда будет доставлен.
+func (a *Agent) enqueueMetrics(jobs chan<- []models.Metrics) {
 	gauges := a.collector.GetGauge()
 	counters := a.collector.GetCounter()
 
@@ -327,10 +371,7 @@ func (a *Agent) enqueueMetrics(ctx context.Context, jobs chan<- []models.Metrics
 		return
 	}
 
-	select {
-	case jobs <- metrics:
-	case <-ctx.Done():
-	}
+	jobs <- metrics
 }
 
 func (a *Agent) worker(id int, jobs <-chan []models.Metrics, wg *sync.WaitGroup) {
@@ -353,12 +394,17 @@ func (a *Agent) sendMetricsBatch(metrics []models.Metrics) {
 		log.Error().Err(err).Msg("failed to gzip body")
 		return
 	}
-	compressedBytes := compressed.Bytes()
+
+	payload, err := a.encryptPayload(compressed.Bytes())
+	if err != nil {
+		log.Error().Err(err).Int("count", len(metrics)).Msg("failed to encrypt metrics batch")
+		return
+	}
 
 	url := fmt.Sprintf("%s/updates/", a.serverAddr)
 
 	sendOnce := func() error {
-		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(compressedBytes))
+		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(payload))
 		if err != nil {
 			return err
 		}
@@ -367,8 +413,10 @@ func (a *Agent) sendMetricsBatch(metrics []models.Metrics) {
 		req.Header.Set("Content-Encoding", "gzip")
 		req.Header.Set("Accept-Encoding", "gzip")
 
+		// Подпись считается по тому, что реально уходит в сеть: при
+		// включённом шифровании — по шифртексту.
 		if a.key != "" {
-			req.Header.Set("HashSHA256", hash.Compute(compressedBytes, a.key))
+			req.Header.Set("HashSHA256", hash.Compute(payload, a.key))
 		}
 
 		resp, err := a.client.Do(req)
@@ -377,8 +425,8 @@ func (a *Agent) sendMetricsBatch(metrics []models.Metrics) {
 		}
 		defer resp.Body.Close()
 
-		if isRetriableStatus(resp.StatusCode) {
-			return fmt.Errorf("server returned retriable status %d", resp.StatusCode)
+		if err := checkResponse(resp); err != nil {
+			return err
 		}
 
 		return nil
@@ -392,6 +440,34 @@ func (a *Agent) sendMetricsBatch(metrics []models.Metrics) {
 	}
 
 	log.Info().Int("count", len(metrics)).Msg("metrics batch sent successfully")
+}
+
+// checkResponse превращает неуспешный ответ сервера в ошибку отправки.
+//
+// 5xx помечаются как временные (их имеет смысл повторить), остальные не-2xx
+// не повторяются, но и молча считаться успехом не должны: чаще всего это
+// несовпадение ключей шифрования или подписи.
+func checkResponse(resp *http.Response) error {
+	if isRetriableStatus(resp.StatusCode) {
+		return fmt.Errorf("server returned retriable status %d", resp.StatusCode)
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("server rejected metrics batch with status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// encryptPayload шифрует тело запроса публичным ключом, если асимметричное
+// шифрование включено (SetCryptoKey). Без ключа тело уходит как есть.
+func (a *Agent) encryptPayload(payload []byte) ([]byte, error) {
+	if a.pubKey == nil {
+		return payload, nil
+	}
+	encrypted, err := crypto.Encrypt(a.pubKey, payload)
+	if err != nil {
+		return nil, fmt.Errorf("agent: не удалось зашифровать тело запроса: %w", err)
+	}
+	return encrypted, nil
 }
 
 func (a *Agent) sendMetricJSON(client *http.Client, metric models.Metrics) {
@@ -412,7 +488,16 @@ func (a *Agent) sendMetricJSON(client *http.Client, metric models.Metrics) {
 		return
 	}
 
-	req, err := http.NewRequest(http.MethodPost, url, &buf)
+	payload, err := a.encryptPayload(buf.Bytes())
+	if err != nil {
+		log.Error().
+			Err(err).
+			Str("metric", metric.ID).
+			Msg("failed to encrypt metric")
+		return
+	}
+
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
 		log.Error().
 			Err(err).
@@ -426,7 +511,7 @@ func (a *Agent) sendMetricJSON(client *http.Client, metric models.Metrics) {
 	req.Header.Set("Accept-Encoding", "gzip")
 
 	if a.key != "" {
-		req.Header.Set("HashSHA256", hash.Compute(buf.Bytes(), a.key))
+		req.Header.Set("HashSHA256", hash.Compute(payload, a.key))
 	}
 
 	resp, err := client.Do(req)

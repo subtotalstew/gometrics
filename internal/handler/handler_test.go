@@ -3,17 +3,26 @@ package handler
 import (
 	"bytes"
 	"compress/gzip"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/subtotalstew/gometrics.git/internal/crypto"
+	"github.com/subtotalstew/gometrics.git/internal/hash"
 	"github.com/subtotalstew/gometrics.git/internal/models"
 	"github.com/subtotalstew/gometrics.git/internal/storage"
 )
@@ -583,4 +592,204 @@ func TestHandler_SetSyncSave(t *testing.T) {
 	if called {
 		t.Error("SetSyncSave invoked callback during registration")
 	}
+}
+
+// --- асимметричное шифрование ---
+
+var (
+	handlerKeyOnce sync.Once
+	handlerKey     *rsa.PrivateKey
+	handlerKeyErr  error
+)
+
+// testPrivateKey возвращает один RSA-ключ на все тесты пакета: генерация
+// ключа заметно дороже самих тестов.
+func testPrivateKey(t *testing.T) *rsa.PrivateKey {
+	t.Helper()
+	handlerKeyOnce.Do(func() {
+		handlerKey, handlerKeyErr = rsa.GenerateKey(rand.Reader, 2048)
+	})
+	require.NoError(t, handlerKeyErr)
+	return handlerKey
+}
+
+// writePrivateKeyFile сохраняет приватный ключ в PEM-файл указанного формата
+// и возвращает путь к нему.
+func writePrivateKeyFile(t *testing.T, blockType string, der []byte) string {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "private.pem")
+	data := pem.EncodeToMemory(&pem.Block{Type: blockType, Bytes: der})
+	require.NoError(t, os.WriteFile(path, data, 0o600))
+	return path
+}
+
+// cryptoRouter собирает роутер в том же порядке middleware, что и сервер:
+// подпись → расшифрование → gzip.
+func cryptoRouter(h *Handler, key string) *chi.Mux {
+	r := chi.NewRouter()
+	if key != "" {
+		h.SetKey(key)
+		r.Use(h.HashMiddleware)
+	}
+	r.Use(h.DecryptMiddleware)
+	r.Use(h.GzipMiddleware)
+	r.Post("/updates/", h.UpdatesJSONHandler)
+	r.Get("/", h.RootHandler)
+	return r
+}
+
+// TestHandler_SetCryptoKey проверяет загрузку приватного ключа и ошибки на
+// пустом и несуществующем пути.
+func TestHandler_SetCryptoKey(t *testing.T) {
+	h := NewHandler(storage.NewMemStorage())
+
+	require.NoError(t, h.SetCryptoKey(""))
+	assert.Nil(t, h.cryptoKey, "пустой путь должен отключать расшифрование")
+
+	require.Error(t, h.SetCryptoKey(filepath.Join(t.TempDir(), "absent.pem")))
+	assert.Nil(t, h.cryptoKey, "после ошибки ключ не должен устанавливаться")
+
+	priv := testPrivateKey(t)
+	path := writePrivateKeyFile(t, "RSA PRIVATE KEY", x509.MarshalPKCS1PrivateKey(priv))
+	require.NoError(t, h.SetCryptoKey(path))
+	assert.NotNil(t, h.cryptoKey)
+}
+
+// TestHandler_SetCryptoKey_PKCS8 проверяет, что ключ в формате PKCS#8
+// (его по умолчанию пишет OpenSSL 3.x) тоже принимается.
+func TestHandler_SetCryptoKey_PKCS8(t *testing.T) {
+	priv := testPrivateKey(t)
+
+	pkcs8, err := x509.MarshalPKCS8PrivateKey(priv)
+	require.NoError(t, err)
+
+	h := NewHandler(storage.NewMemStorage())
+	require.NoError(t, h.SetCryptoKey(writePrivateKeyFile(t, "PRIVATE KEY", pkcs8)))
+	assert.NotNil(t, h.cryptoKey)
+}
+
+// TestDecryptMiddleware_NoKey_PassThrough проверяет, что без ключа
+// middleware не мешает обычным открытым запросам.
+func TestDecryptMiddleware_NoKey_PassThrough(t *testing.T) {
+	s := storage.NewMemStorage()
+	h := NewHandler(s)
+	r := cryptoRouter(h, "")
+
+	body := `[{"id":"plain","type":"gauge","value":1.5}]`
+	req := httptest.NewRequest(http.MethodPost, "/updates/", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Result().StatusCode)
+	_, ok := s.GetGauge("plain")
+	assert.True(t, ok, "открытый запрос должен обрабатываться как раньше")
+}
+
+// TestDecryptMiddleware_DecryptsBody проверяет, что зашифрованное тело
+// расшифровывается и батч сохраняется.
+func TestDecryptMiddleware_DecryptsBody(t *testing.T) {
+	priv := testPrivateKey(t)
+	s := storage.NewMemStorage()
+	h := NewHandler(s)
+	require.NoError(t, h.SetCryptoKey(writePrivateKeyFile(t, "RSA PRIVATE KEY", x509.MarshalPKCS1PrivateKey(priv))))
+	r := cryptoRouter(h, "")
+
+	body := `[{"id":"secret","type":"gauge","value":2.5}]`
+	envelope, err := crypto.Encrypt(&priv.PublicKey, []byte(body))
+	require.NoError(t, err)
+
+	// Content-Encoding не нужен: тело зашифровано, но не сжато.
+	req := httptest.NewRequest(http.MethodPost, "/updates/", bytes.NewReader(envelope))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Result().StatusCode)
+	val, ok := s.GetGauge("secret")
+	require.True(t, ok)
+	assert.Equal(t, 2.5, val)
+}
+
+// TestDecryptMiddleware_RejectsPlaintext проверяет, что при заданном ключе
+// незашифрованный батч отклоняется.
+func TestDecryptMiddleware_RejectsPlaintext(t *testing.T) {
+	priv := testPrivateKey(t)
+	h := NewHandler(storage.NewMemStorage())
+	require.NoError(t, h.SetCryptoKey(writePrivateKeyFile(t, "RSA PRIVATE KEY", x509.MarshalPKCS1PrivateKey(priv))))
+	r := cryptoRouter(h, "")
+
+	body := `[{"id":"plain","type":"gauge","value":1.5}]`
+	req := httptest.NewRequest(http.MethodPost, "/updates/", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Result().StatusCode)
+}
+
+// TestDecryptMiddleware_RejectsGarbage проверяет, что повреждённый конверт
+// даёт 400, а не панику и не 200.
+func TestDecryptMiddleware_RejectsGarbage(t *testing.T) {
+	priv := testPrivateKey(t)
+	s := storage.NewMemStorage()
+	h := NewHandler(s)
+	require.NoError(t, h.SetCryptoKey(writePrivateKeyFile(t, "RSA PRIVATE KEY", x509.MarshalPKCS1PrivateKey(priv))))
+	r := cryptoRouter(h, "")
+
+	envelope, err := crypto.Encrypt(&priv.PublicKey, []byte(`[{"id":"x","type":"gauge","value":1}]`))
+	require.NoError(t, err)
+	envelope[len(envelope)-1] ^= 0xff // портим тег аутентификации
+
+	req := httptest.NewRequest(http.MethodPost, "/updates/", bytes.NewReader(envelope))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Result().StatusCode)
+	_, ok := s.GetGauge("x")
+	assert.False(t, ok, "повреждённый батч не должен сохраняться")
+}
+
+// TestDecryptMiddleware_EmptyBody проверяет, что запросы без тела (GET /)
+// не ломаются при включённом ключе.
+func TestDecryptMiddleware_EmptyBody(t *testing.T) {
+	priv := testPrivateKey(t)
+	h := NewHandler(storage.NewMemStorage())
+	require.NoError(t, h.SetCryptoKey(writePrivateKeyFile(t, "RSA PRIVATE KEY", x509.MarshalPKCS1PrivateKey(priv))))
+	r := cryptoRouter(h, "")
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Result().StatusCode)
+}
+
+// TestDecryptMiddleware_FullChain проверяет всю цепочку как у реального
+// агента: тело сжато gzip, зашифровано и подписано. Если middleware в
+// роутере окажутся в неверном порядке (например, gzip раньше расшифрования),
+// тест упадёт.
+func TestDecryptMiddleware_FullChain(t *testing.T) {
+	priv := testPrivateKey(t)
+	s := storage.NewMemStorage()
+	h := NewHandler(s)
+	require.NoError(t, h.SetCryptoKey(writePrivateKeyFile(t, "RSA PRIVATE KEY", x509.MarshalPKCS1PrivateKey(priv))))
+	r := cryptoRouter(h, "sign-key")
+
+	body := `[{"id":"hash_gauge","type":"gauge","value":10.25}]`
+	gzipped := compressData(t, []byte(body))
+
+	envelope, err := crypto.Encrypt(&priv.PublicKey, gzipped)
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodPost, "/updates/", bytes.NewReader(envelope))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Encoding", "gzip")
+	req.Header.Set("HashSHA256", hash.Compute(envelope, "sign-key"))
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Result().StatusCode)
+	val, ok := s.GetGauge("hash_gauge")
+	require.True(t, ok)
+	assert.Equal(t, 10.25, val)
 }

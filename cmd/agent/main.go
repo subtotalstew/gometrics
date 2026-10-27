@@ -1,5 +1,6 @@
 // Command agent собирает метрики рантайма и системы и отправляет их
-// на сервер метрик батчами через POST /updates/.
+// на сервер метрик батчами через POST /updates/. Тело запроса можно
+// зашифровать публичным ключом (флаг -crypto-key / CRYPTO_KEY).
 //
 // main не вызывает os.Exit напрямую (это запрещено анализатором noosexit);
 // вся работа делегируется run(), а ошибка конфигурации логируется через
@@ -20,11 +21,13 @@ import (
 
 // config — параметры запуска агента.
 type config struct {
+	configPath     string
 	addr           string
 	pollInterval   int
 	reportInterval int
 	key            string
 	rateLimit      int
+	cryptoKey      string
 }
 
 var (
@@ -63,6 +66,16 @@ func run() error {
 		cfg.rateLimit,
 		cfg.key,
 	)
+
+	// Публичный ключ читается на старте: ошибка в пути должна быть видна
+	// сразу, а не после первого цикла отправки метрик.
+	if cfg.cryptoKey != "" {
+		if err := a.SetCryptoKey(cfg.cryptoKey); err != nil {
+			return err
+		}
+		log.Printf("agent: асимметричное шифрование включено, публичный ключ: %s", cfg.cryptoKey)
+	}
+
 	a.Run()
 	return nil
 }
@@ -81,17 +94,34 @@ func loadConfigFromArgs() (config, error) {
 }
 
 // loadConfigFrom — общая логика для loadConfig и loadConfigFromArgs.
-// Флаги и env-переменные; env имеет приоритет.
+// Приоритет источников: файл конфигурации < флаги < переменные окружения.
 func loadConfigFrom(fs *flag.FlagSet) (config, error) {
 	cfg := config{}
 
+	fs.StringVar(&cfg.configPath, "c", "", "path to JSON config file")
+	fs.StringVar(&cfg.configPath, "config", "", "path to JSON config file (alias for -c)")
 	fs.StringVar(&cfg.addr, "a", "localhost:8080", "server address")
 	fs.IntVar(&cfg.pollInterval, "p", 2, "poll interval in seconds")
 	fs.IntVar(&cfg.reportInterval, "r", 10, "report interval in seconds")
 	fs.StringVar(&cfg.key, "k", "", "key for encrypt")
+	fs.StringVar(&cfg.cryptoKey, "crypto-key", "", "path to public key for asymmetric encryption")
 	fs.IntVar(&cfg.rateLimit, "l", 1, "max number of simultaneously outgoing requests to the server")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
+		return config{}, err
+	}
+
+	// Запоминаем явно заданные флаги: их значения файл не перекрывает.
+	explicit := make(map[string]bool, fs.NFlag())
+	fs.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
+
+	// CONFIG задаёт путь к файлу и, как и остальные env, приоритетнее флага.
+	if v := os.Getenv("CONFIG"); v != "" {
+		cfg.configPath = v
+	}
+	if err := applyFileConfig(&cfg, cfg.configPath, func(name string) bool {
+		return explicit[name]
+	}); err != nil {
 		return config{}, err
 	}
 
@@ -114,6 +144,9 @@ func loadConfigFrom(fs *flag.FlagSet) (config, error) {
 	}
 	if v := os.Getenv("KEY"); v != "" {
 		cfg.key = v
+	}
+	if v := os.Getenv("CRYPTO_KEY"); v != "" {
+		cfg.cryptoKey = v
 	}
 	if v := os.Getenv("RATE_LIMIT"); v != "" {
 		n, err := strconv.Atoi(v)

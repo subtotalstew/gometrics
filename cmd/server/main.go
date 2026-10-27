@@ -35,14 +35,21 @@ var (
 	buildCommit  = "N/A"
 )
 
+// shutdownTimeout — сколько ждём завершения уже начатых HTTP-запросов при
+// остановке. Это время нужно, чтобы их данные успели дойти до хранилища
+// до финального сохранения.
+const shutdownTimeout = 10 * time.Second
+
 // config — параметры запуска сервера.
 type config struct {
+	configPath    string
 	addr          string
 	storeInterval int
 	filePath      string
 	restore       bool
 	databaseDSN   string
 	key           string
+	cryptoKey     string
 	auditFile     string
 	auditURL      string
 	pprofAddr     string
@@ -63,7 +70,7 @@ func printBuildInfo() {
 }
 
 // run загружает конфигурацию, собирает зависимости, запускает сервер
-// и блокируется до получения SIGINT/SIGTERM.
+// и блокируется до получения SIGINT/SIGTERM/SIGQUIT.
 func run() error {
 	cfg, err := loadConfig()
 	if err != nil {
@@ -85,21 +92,39 @@ func loadConfigFromArgs() (config, error) {
 	return loadConfigFrom(fs)
 }
 
-// loadConfigFrom — общая логика парсинга флагов и env.
+// loadConfigFrom — общая логика парсинга флагов, файла конфигурации и env.
+// Приоритет источников: файл конфигурации < флаги < переменные окружения.
 func loadConfigFrom(fs *flag.FlagSet) (config, error) {
 	cfg := config{}
 
+	fs.StringVar(&cfg.configPath, "c", "", "path to JSON config file")
+	fs.StringVar(&cfg.configPath, "config", "", "path to JSON config file (alias for -c)")
 	fs.StringVar(&cfg.addr, "a", "localhost:8080", "address and port to run server, format: <hostname>:<port>")
 	fs.IntVar(&cfg.storeInterval, "i", 300, "interval in seconds to persist metrics to disk (0 = synchronous save)")
 	fs.StringVar(&cfg.filePath, "f", "metrics-store.json", "path to file for persisting metrics")
 	fs.BoolVar(&cfg.restore, "r", true, "whether to restore previously saved metrics on start")
 	fs.StringVar(&cfg.databaseDSN, "d", "", "database connection string")
 	fs.StringVar(&cfg.key, "k", "", "key for decrypt")
+	fs.StringVar(&cfg.cryptoKey, "crypto-key", "", "path to private key file for asymmetric decryption")
 	fs.StringVar(&cfg.auditFile, "audit-file", "", "path to audit log file")
 	fs.StringVar(&cfg.auditURL, "audit-url", "", "URL for audit log delivery")
 	fs.StringVar(&cfg.pprofAddr, "pprof-addr", "", "address of the pprof/debug HTTP server (empty = disabled)")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
+		return config{}, err
+	}
+
+	// Запоминаем явно заданные флаги: их значения файл не перекрывает.
+	explicit := make(map[string]bool, fs.NFlag())
+	fs.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
+
+	// CONFIG задаёт путь к файлу и, как и остальные env, приоритетнее флага.
+	if v := os.Getenv("CONFIG"); v != "" {
+		cfg.configPath = v
+	}
+	if err := applyFileConfig(&cfg, cfg.configPath, func(name string) bool {
+		return explicit[name]
+	}); err != nil {
 		return config{}, err
 	}
 
@@ -129,6 +154,9 @@ func loadConfigFrom(fs *flag.FlagSet) (config, error) {
 	if v := os.Getenv("KEY"); v != "" {
 		cfg.key = v
 	}
+	if v := os.Getenv("CRYPTO_KEY"); v != "" {
+		cfg.cryptoKey = v
+	}
 	if v := os.Getenv("AUDIT_FILE"); v != "" {
 		cfg.auditFile = v
 	}
@@ -143,6 +171,11 @@ func loadConfigFrom(fs *flag.FlagSet) (config, error) {
 
 // buildRouter собирает chi-роутер с полным стеком middleware.
 // Вынесено из serve(), чтобы тестировать маршрутизацию без запуска сервера.
+//
+// Порядок middleware важен: подпись проверяется по байтам, пришедшим по сети
+// (по шифртексту), затем тело расшифровывается приватным ключом, и только
+// после этого распаковывается gzip. Ключ расшифрования задаётся в serve через
+// handler.SetCryptoKey; без ключа DecryptMiddleware ничего не делает.
 func buildRouter(h *handler.Handler, key string) *chi.Mux {
 	r := chi.NewRouter()
 
@@ -150,6 +183,7 @@ func buildRouter(h *handler.Handler, key string) *chi.Mux {
 		h.SetKey(key)
 		r.Use(h.HashMiddleware)
 	}
+	r.Use(h.DecryptMiddleware)
 	r.Use(h.GzipMiddleware)
 	r.Use(h.LoggingMiddleware)
 	r.Use(middleware.Recoverer)
@@ -219,6 +253,15 @@ func serve(cfg config) error {
 
 	h := handler.NewHandler(metricsStorage)
 
+	// Приватный ключ читается на старте: опечатка в пути или битый файл
+	// должны останавливать сервер сразу, а не ломать каждый батч агента.
+	if cfg.cryptoKey != "" {
+		if err := h.SetCryptoKey(cfg.cryptoKey); err != nil {
+			return fmt.Errorf("не удалось загрузить приватный ключ: %w", err)
+		}
+		log.Info().Str("key", cfg.cryptoKey).Msg("асимметричное шифрование: включено")
+	}
+
 	// Аудит включается, только если задан хотя бы один приёмник.
 	if cfg.auditFile != "" || cfg.auditURL != "" {
 		auditSubject := audit.NewSubject()
@@ -245,6 +288,18 @@ func serve(cfg config) error {
 
 	var stop, done chan struct{}
 
+	// stopPeriodic останавливает фоновое сохранение и ждёт, пока текущая
+	// запись на диск закончится. Повторный вызов ничего не делает.
+	stopPeriodic := func() {
+		if stop == nil {
+			return
+		}
+		close(stop)
+		<-done
+		stop = nil
+	}
+	defer stopPeriodic()
+
 	if cfg.databaseDSN == "" && cfg.filePath != "" {
 		if memStorage, ok := metricsStorage.(*storage.MemStorage); ok {
 			if cfg.storeInterval == 0 {
@@ -267,34 +322,52 @@ func serve(cfg config) error {
 	r := buildRouter(h, cfg.key)
 	srv := &http.Server{Addr: cfg.addr, Handler: r}
 
+	// Ошибка запуска (например, занятый порт) не должна оставлять процесс
+	// висеть в ожидании сигнала.
+	srvErr := make(chan error, 1)
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Error().Err(err).Msg("HTTP-сервер завершился с ошибкой")
+			srvErr <- err
 		}
 	}()
 
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	<-sigChan
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 
-	log.Info().Msg("shutting down")
-
-	if stop != nil {
-		close(stop)
-		<-done
+	select {
+	case sig := <-sigChan:
+		// Снимаем обработчик: повторный сигнал завершит процесс сразу,
+		// не дожидаясь, пока доработают активные запросы.
+		signal.Stop(sigChan)
+		log.Info().Str("signal", sig.String()).Msg("получен сигнал завершения")
+	case err := <-srvErr:
+		signal.Stop(sigChan)
+		return fmt.Errorf("HTTP-сервер не смог запуститься: %w", err)
 	}
 
+	// 1. Перестаём принимать новые запросы и дожидаемся уже начатых:
+	//    их данные ещё должны попасть в хранилище. Финальное сохранение
+	//    имеет смысл только после этого шага.
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Error().Err(err).Msg("не удалось дождаться активных запросов, закрываем соединения принудительно")
+		_ = srv.Close()
+	}
+
+	// 2. Останавливаем фоновое сохранение: дальше файл пишем только мы.
+	stopPeriodic()
+
+	// 3. Сохраняем всё, что осталось в памяти, включая данные запросов,
+	//    обслуженных во время остановки.
 	if cfg.databaseDSN == "" && cfg.filePath != "" {
 		if memStorage, ok := metricsStorage.(*storage.MemStorage); ok {
 			if err := storage.SaveToFile(memStorage, cfg.filePath); err != nil {
-				log.Error().Err(err).Msg("не удалось сохранить метрики при завершении работы")
+				return fmt.Errorf("не удалось сохранить метрики при завершении работы: %w", err)
 			}
+			log.Info().Str("path", cfg.filePath).Msg("метрики сохранены при завершении работы")
 		}
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	_ = srv.Shutdown(ctx)
 
 	return nil
 }
