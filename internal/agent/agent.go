@@ -51,6 +51,8 @@ func compressGzip(dst *bytes.Buffer, data []byte) error {
 // Collector накапливает метрики в памяти: gauge — текущие значения
 // рантайма и системы, counter — число циклов опроса (PollCount).
 // Безопасен для конкурентного использования.
+//
+// generate:reset
 type Collector struct {
 	mu      sync.Mutex
 	gauge   map[string]float64
@@ -382,9 +384,7 @@ func (a *Agent) sendMetricsBatch(metrics []models.Metrics) {
 		return nil
 	}
 
-	err = retry.Do("send_metrics_batch", sendOnce, func(err error) bool {
-		return isRetriableHTTPError(err)
-	})
+	err = retry.Do("send_metrics_batch", sendOnce, isRetriableHTTPError)
 
 	if err != nil {
 		log.Error().Err(err).Int("count", len(metrics)).Msg("failed to send metrics batch after retries")
