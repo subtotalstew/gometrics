@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -12,7 +13,7 @@ import (
 )
 
 var envKeys = []string{
-	"ADDRESS", "STORE_INTERVAL", "FILE_STORAGE_PATH", "RESTORE",
+	"CONFIG", "ADDRESS", "STORE_INTERVAL", "FILE_STORAGE_PATH", "RESTORE",
 	"DATABASE_DSN", "KEY", "CRYPTO_KEY", "AUDIT_FILE", "AUDIT_URL", "PPROF_ADDR",
 }
 
@@ -157,6 +158,152 @@ func TestLoadConfigFrom_CryptoKeyFlag(t *testing.T) {
 	}
 }
 
+// --- файл конфигурации ---
+
+// TestLoadConfigFrom_FileConfig проверяет, что все опции сервера
+// читаются из JSON-файла, заданного флагом -c.
+func TestLoadConfigFrom_FileConfig(t *testing.T) {
+	saved := saveEnv()
+	defer restoreEnv(saved)
+	clearEnv()
+
+	path := writeConfigFile(t, `{
+		"address": "file:9999",
+		"restore": false,
+		"store_interval": "5s",
+		"store_file": "/tmp/file.db",
+		"database_dsn": "postgres://file",
+		"crypto_key": "/tmp/file.pem",
+		"key": "filekey",
+		"audit_file": "/tmp/file-audit.log",
+		"audit_url": "http://file-audit",
+		"pprof_addr": "localhost:7070"
+	}`)
+
+	oldArgs := os.Args
+	os.Args = []string{"server", "-c", path}
+	defer func() { os.Args = oldArgs }()
+
+	cfg, err := loadConfigFromArgs()
+	if err != nil {
+		t.Fatalf("loadConfigFromArgs() error = %v", err)
+	}
+	if cfg.addr != "file:9999" {
+		t.Errorf("addr = %q, want file:9999", cfg.addr)
+	}
+	if cfg.storeInterval != 5 {
+		t.Errorf("storeInterval = %d, want 5 (from 5s)", cfg.storeInterval)
+	}
+	if cfg.filePath != "/tmp/file.db" {
+		t.Errorf("filePath = %q, want /tmp/file.db", cfg.filePath)
+	}
+	if cfg.restore {
+		t.Error("restore = true, want false")
+	}
+	if cfg.databaseDSN != "postgres://file" {
+		t.Errorf("databaseDSN = %q", cfg.databaseDSN)
+	}
+	if cfg.cryptoKey != "/tmp/file.pem" {
+		t.Errorf("cryptoKey = %q", cfg.cryptoKey)
+	}
+	if cfg.key != "filekey" {
+		t.Errorf("key = %q", cfg.key)
+	}
+	if cfg.auditFile != "/tmp/file-audit.log" {
+		t.Errorf("auditFile = %q", cfg.auditFile)
+	}
+	if cfg.auditURL != "http://file-audit" {
+		t.Errorf("auditURL = %q", cfg.auditURL)
+	}
+	if cfg.pprofAddr != "localhost:7070" {
+		t.Errorf("pprofAddr = %q", cfg.pprofAddr)
+	}
+}
+
+// TestLoadConfigFrom_FileConfigPriority проверяет приоритет источников:
+// флаги и env перекрывают файл, файл — значения по умолчанию.
+func TestLoadConfigFrom_FileConfigPriority(t *testing.T) {
+	saved := saveEnv()
+	defer restoreEnv(saved)
+	clearEnv()
+
+	path := writeConfigFile(t, `{
+		"address": "file:9999",
+		"restore": false,
+		"store_interval": "5s",
+		"store_file": "/tmp/file.db"
+	}`)
+
+	oldArgs := os.Args
+	os.Args = []string{"server", "-c", path, "-a", "flag:1234", "-i", "100"}
+	defer func() { os.Args = oldArgs }()
+
+	_ = os.Setenv("ADDRESS", "env:5678")
+	_ = os.Setenv("RESTORE", "true")
+
+	cfg, err := loadConfigFromArgs()
+	if err != nil {
+		t.Fatalf("loadConfigFromArgs() error = %v", err)
+	}
+	if cfg.addr != "env:5678" {
+		t.Errorf("addr = %q, want env:5678 (env > flag > file)", cfg.addr)
+	}
+	if cfg.storeInterval != 100 {
+		t.Errorf("storeInterval = %d, want 100 (flag > file)", cfg.storeInterval)
+	}
+	if !cfg.restore {
+		t.Error("restore = false, want true (env > file)")
+	}
+	if cfg.filePath != "/tmp/file.db" {
+		t.Errorf("filePath = %q, want /tmp/file.db (file > default)", cfg.filePath)
+	}
+}
+
+// TestLoadConfigFrom_ConfigEnv проверяет, что путь к файлу можно задать
+// переменной окружения CONFIG без флага.
+func TestLoadConfigFrom_ConfigEnv(t *testing.T) {
+	saved := saveEnv()
+	defer restoreEnv(saved)
+	clearEnv()
+
+	path := writeConfigFile(t, `{"address": "envpath:1111"}`)
+	_ = os.Setenv("CONFIG", path)
+
+	oldArgs := os.Args
+	os.Args = []string{"server"}
+	defer func() { os.Args = oldArgs }()
+
+	cfg, err := loadConfigFromArgs()
+	if err != nil {
+		t.Fatalf("loadConfigFromArgs() error = %v", err)
+	}
+	if cfg.addr != "envpath:1111" {
+		t.Errorf("addr = %q, want envpath:1111", cfg.addr)
+	}
+}
+
+// TestLoadConfigFrom_FileConfigErrors проверяет, что битый или
+// отсутствующий файл конфигурации — ошибка запуска.
+func TestLoadConfigFrom_FileConfigErrors(t *testing.T) {
+	saved := saveEnv()
+	defer restoreEnv(saved)
+	clearEnv()
+
+	oldArgs := os.Args
+	defer func() { os.Args = oldArgs }()
+
+	os.Args = []string{"server", "-config", filepath.Join(t.TempDir(), "missing.json")}
+	if _, err := loadConfigFromArgs(); err == nil {
+		t.Fatal("loadConfigFromArgs() = nil, want error for missing config file")
+	}
+
+	badPath := writeConfigFile(t, `{"store_interval": "не интервал"}`)
+	os.Args = []string{"server", "-c", badPath}
+	if _, err := loadConfigFromArgs(); err == nil {
+		t.Fatal("loadConfigFromArgs() = nil, want error for invalid store_interval")
+	}
+}
+
 // --- buildRouter ---
 
 func TestBuildRouter_AllRoutes(t *testing.T) {
@@ -267,6 +414,17 @@ func TestRouter_UpdatesBatch(t *testing.T) {
 }
 
 // --- утилиты ---
+
+// writeConfigFile создаёт временный JSON-файл конфигурации и возвращает путь.
+func writeConfigFile(t *testing.T, body string) string {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	return path
+}
 
 func saveEnv() map[string]string {
 	saved := make(map[string]string, len(envKeys))

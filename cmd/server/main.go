@@ -37,6 +37,7 @@ var (
 
 // config — параметры запуска сервера.
 type config struct {
+	configPath    string
 	addr          string
 	storeInterval int
 	filePath      string
@@ -86,10 +87,13 @@ func loadConfigFromArgs() (config, error) {
 	return loadConfigFrom(fs)
 }
 
-// loadConfigFrom — общая логика парсинга флагов и env.
+// loadConfigFrom — общая логика парсинга флагов, файла конфигурации и env.
+// Приоритет источников: файл конфигурации < флаги < переменные окружения.
 func loadConfigFrom(fs *flag.FlagSet) (config, error) {
 	cfg := config{}
 
+	fs.StringVar(&cfg.configPath, "c", "", "path to JSON config file")
+	fs.StringVar(&cfg.configPath, "config", "", "path to JSON config file (alias for -c)")
 	fs.StringVar(&cfg.addr, "a", "localhost:8080", "address and port to run server, format: <hostname>:<port>")
 	fs.IntVar(&cfg.storeInterval, "i", 300, "interval in seconds to persist metrics to disk (0 = synchronous save)")
 	fs.StringVar(&cfg.filePath, "f", "metrics-store.json", "path to file for persisting metrics")
@@ -102,6 +106,20 @@ func loadConfigFrom(fs *flag.FlagSet) (config, error) {
 	fs.StringVar(&cfg.pprofAddr, "pprof-addr", "", "address of the pprof/debug HTTP server (empty = disabled)")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
+		return config{}, err
+	}
+
+	// Запоминаем явно заданные флаги: их значения файл не перекрывает.
+	explicit := make(map[string]bool, fs.NFlag())
+	fs.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
+
+	// CONFIG задаёт путь к файлу и, как и остальные env, приоритетнее флага.
+	if v := os.Getenv("CONFIG"); v != "" {
+		cfg.configPath = v
+	}
+	if err := applyFileConfig(&cfg, cfg.configPath, func(name string) bool {
+		return explicit[name]
+	}); err != nil {
 		return config{}, err
 	}
 

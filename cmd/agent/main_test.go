@@ -2,12 +2,14 @@ package main
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 )
 
 // envKeys — переменные окружения, которые читает loadConfigFrom.
 // Используются в saveEnv/restoreEnv/clearEnv, чтобы не трогать чужие env.
 var envKeys = []string{
+	"CONFIG",
 	"ADDRESS",
 	"POLL_INTERVAL",
 	"REPORT_INTERVAL",
@@ -270,7 +272,148 @@ func TestLoadConfig_EnvOverridesFlags(t *testing.T) {
 	}
 }
 
+// --- файл конфигурации ---
+
+// TestLoadConfig_FileConfig проверяет чтение всех опций агента
+// из JSON-файла, заданного флагом -c.
+func TestLoadConfig_FileConfig(t *testing.T) {
+	saved := saveEnv()
+	defer restoreEnv(saved)
+	clearEnv()
+
+	path := writeConfigFile(t, `{
+		"address": "file:9999",
+		"report_interval": "15s",
+		"poll_interval": "3s",
+		"crypto_key": "/tmp/file.pem",
+		"key": "filekey",
+		"rate_limit": 5
+	}`)
+
+	oldArgs := os.Args
+	os.Args = []string{"agent", "-c", path}
+	defer func() { os.Args = oldArgs }()
+
+	cfg, err := loadConfigFromArgs()
+	if err != nil {
+		t.Fatalf("loadConfigFromArgs() error = %v", err)
+	}
+	if cfg.addr != "file:9999" {
+		t.Errorf("addr = %q, want file:9999", cfg.addr)
+	}
+	if cfg.pollInterval != 3 {
+		t.Errorf("pollInterval = %d, want 3 (from 3s)", cfg.pollInterval)
+	}
+	if cfg.reportInterval != 15 {
+		t.Errorf("reportInterval = %d, want 15 (from 15s)", cfg.reportInterval)
+	}
+	if cfg.cryptoKey != "/tmp/file.pem" {
+		t.Errorf("cryptoKey = %q", cfg.cryptoKey)
+	}
+	if cfg.key != "filekey" {
+		t.Errorf("key = %q", cfg.key)
+	}
+	if cfg.rateLimit != 5 {
+		t.Errorf("rateLimit = %d, want 5", cfg.rateLimit)
+	}
+}
+
+// TestLoadConfig_FileConfigPriority проверяет, что флаги и env
+// перекрывают значения из файла, а файл — значения по умолчанию.
+func TestLoadConfig_FileConfigPriority(t *testing.T) {
+	saved := saveEnv()
+	defer restoreEnv(saved)
+	clearEnv()
+
+	path := writeConfigFile(t, `{
+		"address": "file:9999",
+		"report_interval": "15s",
+		"poll_interval": "3s",
+		"key": "filekey"
+	}`)
+
+	oldArgs := os.Args
+	os.Args = []string{"agent", "-c", path, "-p", "7"}
+	defer func() { os.Args = oldArgs }()
+
+	_ = os.Setenv("ADDRESS", "env:5678")
+	_ = os.Setenv("REPORT_INTERVAL", "30")
+
+	cfg, err := loadConfigFromArgs()
+	if err != nil {
+		t.Fatalf("loadConfigFromArgs() error = %v", err)
+	}
+	if cfg.addr != "env:5678" {
+		t.Errorf("addr = %q, want env:5678 (env > flag > file)", cfg.addr)
+	}
+	if cfg.pollInterval != 7 {
+		t.Errorf("pollInterval = %d, want 7 (flag > file)", cfg.pollInterval)
+	}
+	if cfg.reportInterval != 30 {
+		t.Errorf("reportInterval = %d, want 30 (env > file)", cfg.reportInterval)
+	}
+	if cfg.key != "filekey" {
+		t.Errorf("key = %q, want filekey (file > default)", cfg.key)
+	}
+}
+
+// TestLoadConfig_ConfigEnv проверяет, что путь к файлу можно задать
+// переменной окружения CONFIG без флага.
+func TestLoadConfig_ConfigEnv(t *testing.T) {
+	saved := saveEnv()
+	defer restoreEnv(saved)
+	clearEnv()
+
+	path := writeConfigFile(t, `{"poll_interval": "4s"}`)
+	_ = os.Setenv("CONFIG", path)
+
+	oldArgs := os.Args
+	os.Args = []string{"agent"}
+	defer func() { os.Args = oldArgs }()
+
+	cfg, err := loadConfigFromArgs()
+	if err != nil {
+		t.Fatalf("loadConfigFromArgs() error = %v", err)
+	}
+	if cfg.pollInterval != 4 {
+		t.Errorf("pollInterval = %d, want 4", cfg.pollInterval)
+	}
+}
+
+// TestLoadConfig_FileConfigErrors проверяет, что отсутствующий файл
+// и битые значения в нём — ошибка запуска.
+func TestLoadConfig_FileConfigErrors(t *testing.T) {
+	saved := saveEnv()
+	defer restoreEnv(saved)
+	clearEnv()
+
+	oldArgs := os.Args
+	defer func() { os.Args = oldArgs }()
+
+	os.Args = []string{"agent", "-config", filepath.Join(t.TempDir(), "missing.json")}
+	if _, err := loadConfigFromArgs(); err == nil {
+		t.Fatal("loadConfigFromArgs() = nil, want error for missing config file")
+	}
+
+	badPath := writeConfigFile(t, `{"poll_interval": "abc"}`)
+	os.Args = []string{"agent", "-c", badPath}
+	if _, err := loadConfigFromArgs(); err == nil {
+		t.Fatal("loadConfigFromArgs() = nil, want error for invalid poll_interval")
+	}
+}
+
 // --- вспомогательные функции ---
+
+// writeConfigFile создаёт временный JSON-файл конфигурации и возвращает путь.
+func writeConfigFile(t *testing.T, body string) string {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	return path
+}
 
 // saveEnv сохраняет текущие значения env-переменных, чтобы
 // восстановить их после теста.
