@@ -13,7 +13,7 @@ import (
 
 var envKeys = []string{
 	"ADDRESS", "STORE_INTERVAL", "FILE_STORAGE_PATH", "RESTORE",
-	"DATABASE_DSN", "KEY", "AUDIT_FILE", "AUDIT_URL", "PPROF_ADDR",
+	"DATABASE_DSN", "KEY", "CRYPTO_KEY", "AUDIT_FILE", "AUDIT_URL", "PPROF_ADDR",
 }
 
 // --- config ---
@@ -46,6 +46,9 @@ func TestLoadConfigFrom_Defaults(t *testing.T) {
 	if cfg.databaseDSN != "" {
 		t.Errorf("databaseDSN = %q, want empty", cfg.databaseDSN)
 	}
+	if cfg.cryptoKey != "" {
+		t.Errorf("cryptoKey = %q, want empty", cfg.cryptoKey)
+	}
 }
 
 func TestLoadConfigFrom_EnvOverridesFlags(t *testing.T) {
@@ -63,6 +66,7 @@ func TestLoadConfigFrom_EnvOverridesFlags(t *testing.T) {
 	_ = os.Setenv("RESTORE", "false")
 	_ = os.Setenv("DATABASE_DSN", "postgres://x")
 	_ = os.Setenv("KEY", "k")
+	_ = os.Setenv("CRYPTO_KEY", "/tmp/private.pem")
 	_ = os.Setenv("AUDIT_FILE", "/tmp/audit.log")
 	_ = os.Setenv("AUDIT_URL", "http://audit.example")
 	_ = os.Setenv("PPROF_ADDR", "localhost:6060")
@@ -88,6 +92,9 @@ func TestLoadConfigFrom_EnvOverridesFlags(t *testing.T) {
 	}
 	if cfg.key != "k" {
 		t.Errorf("key = %q, want k", cfg.key)
+	}
+	if cfg.cryptoKey != "/tmp/private.pem" {
+		t.Errorf("cryptoKey = %q, want /tmp/private.pem", cfg.cryptoKey)
 	}
 	if cfg.auditFile != "/tmp/audit.log" {
 		t.Errorf("auditFile = %q", cfg.auditFile)
@@ -127,6 +134,26 @@ func TestLoadConfigFrom_InvalidRestore(t *testing.T) {
 	_ = os.Setenv("RESTORE", "notabool")
 	if _, err := loadConfigFromArgs(); err == nil {
 		t.Fatal("loadConfigFromArgs() = nil, want error for invalid RESTORE")
+	}
+}
+
+// TestLoadConfigFrom_CryptoKeyFlag проверяет флаг -crypto-key: путь до
+// приватного ключа для расшифрования запросов агента.
+func TestLoadConfigFrom_CryptoKeyFlag(t *testing.T) {
+	saved := saveEnv()
+	defer restoreEnv(saved)
+	clearEnv()
+
+	oldArgs := os.Args
+	os.Args = []string{"server", "-crypto-key", "/tmp/flag-private.pem"}
+	defer func() { os.Args = oldArgs }()
+
+	cfg, err := loadConfigFromArgs()
+	if err != nil {
+		t.Fatalf("loadConfigFromArgs() error = %v", err)
+	}
+	if cfg.cryptoKey != "/tmp/flag-private.pem" {
+		t.Errorf("cryptoKey = %q, want /tmp/flag-private.pem", cfg.cryptoKey)
 	}
 }
 

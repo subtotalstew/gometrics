@@ -1,5 +1,6 @@
 // Command agent собирает метрики рантайма и системы и отправляет их
-// на сервер метрик батчами через POST /updates/.
+// на сервер метрик батчами через POST /updates/. Тело запроса можно
+// зашифровать публичным ключом (флаг -crypto-key / CRYPTO_KEY).
 //
 // main не вызывает os.Exit напрямую (это запрещено анализатором noosexit);
 // вся работа делегируется run(), а ошибка конфигурации логируется через
@@ -25,6 +26,7 @@ type config struct {
 	reportInterval int
 	key            string
 	rateLimit      int
+	cryptoKey      string
 }
 
 var (
@@ -63,6 +65,16 @@ func run() error {
 		cfg.rateLimit,
 		cfg.key,
 	)
+
+	// Публичный ключ читается на старте: ошибка в пути должна быть видна
+	// сразу, а не после первого цикла отправки метрик.
+	if cfg.cryptoKey != "" {
+		if err := a.SetCryptoKey(cfg.cryptoKey); err != nil {
+			return err
+		}
+		log.Printf("agent: асимметричное шифрование включено, публичный ключ: %s", cfg.cryptoKey)
+	}
+
 	a.Run()
 	return nil
 }
@@ -89,6 +101,7 @@ func loadConfigFrom(fs *flag.FlagSet) (config, error) {
 	fs.IntVar(&cfg.pollInterval, "p", 2, "poll interval in seconds")
 	fs.IntVar(&cfg.reportInterval, "r", 10, "report interval in seconds")
 	fs.StringVar(&cfg.key, "k", "", "key for encrypt")
+	fs.StringVar(&cfg.cryptoKey, "crypto-key", "", "path to public key for asymmetric encryption")
 	fs.IntVar(&cfg.rateLimit, "l", 1, "max number of simultaneously outgoing requests to the server")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
@@ -114,6 +127,9 @@ func loadConfigFrom(fs *flag.FlagSet) (config, error) {
 	}
 	if v := os.Getenv("KEY"); v != "" {
 		cfg.key = v
+	}
+	if v := os.Getenv("CRYPTO_KEY"); v != "" {
+		cfg.cryptoKey = v
 	}
 	if v := os.Getenv("RATE_LIMIT"); v != "" {
 		n, err := strconv.Atoi(v)

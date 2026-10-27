@@ -12,6 +12,7 @@ var envKeys = []string{
 	"POLL_INTERVAL",
 	"REPORT_INTERVAL",
 	"KEY",
+	"CRYPTO_KEY",
 	"RATE_LIMIT",
 }
 
@@ -43,6 +44,9 @@ func TestLoadConfig_Defaults(t *testing.T) {
 	if cfg.key != "" {
 		t.Errorf("key = %q, want empty", cfg.key)
 	}
+	if cfg.cryptoKey != "" {
+		t.Errorf("cryptoKey = %q, want empty", cfg.cryptoKey)
+	}
 	if cfg.rateLimit != 1 {
 		t.Errorf("rateLimit = %d, want 1", cfg.rateLimit)
 	}
@@ -71,6 +75,9 @@ func TestLoadConfig_FromEnv(t *testing.T) {
 	if err := os.Setenv("KEY", "secret"); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Setenv("CRYPTO_KEY", "/tmp/public.pem"); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Setenv("RATE_LIMIT", "3"); err != nil {
 		t.Fatal(err)
 	}
@@ -90,6 +97,9 @@ func TestLoadConfig_FromEnv(t *testing.T) {
 	}
 	if cfg.key != "secret" {
 		t.Errorf("key = %q, want secret", cfg.key)
+	}
+	if cfg.cryptoKey != "/tmp/public.pem" {
+		t.Errorf("cryptoKey = %q, want /tmp/public.pem", cfg.cryptoKey)
 	}
 	if cfg.rateLimit != 3 {
 		t.Errorf("rateLimit = %d, want 3", cfg.rateLimit)
@@ -202,7 +212,8 @@ func TestLoadConfigFrom_FlagsOverrideDefaults(t *testing.T) {
 	clearEnv()
 
 	oldArgs := os.Args
-	os.Args = []string{"agent", "-a", "flagaddr:1234", "-p", "7", "-r", "21", "-k", "flagkey", "-l", "4"}
+	os.Args = []string{"agent", "-a", "flagaddr:1234", "-p", "7", "-r", "21", "-k", "flagkey", "-l", "4",
+		"-crypto-key", "/tmp/flag-public.pem"}
 	defer func() { os.Args = oldArgs }()
 
 	cfg, err := loadConfigFromArgs()
@@ -220,6 +231,9 @@ func TestLoadConfigFrom_FlagsOverrideDefaults(t *testing.T) {
 	}
 	if cfg.key != "flagkey" {
 		t.Errorf("key = %q, want flagkey", cfg.key)
+	}
+	if cfg.cryptoKey != "/tmp/flag-public.pem" {
+		t.Errorf("cryptoKey = %q, want /tmp/flag-public.pem", cfg.cryptoKey)
 	}
 	if cfg.rateLimit != 4 {
 		t.Errorf("rateLimit = %d, want 4", cfg.rateLimit)

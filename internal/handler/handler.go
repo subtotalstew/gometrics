@@ -1,5 +1,6 @@
 // Package handler содержит HTTP-хендлеры сервиса метрик, middleware
-// (gzip, логирование, подпись HMAC-SHA256) и маршрутизацию этих хендлеров.
+// (gzip, логирование, подпись HMAC-SHA256, расшифрование тела запроса
+// асимметричным ключом) и маршрутизацию этих хендлеров.
 //
 // Эндпоинты сервиса:
 //
@@ -17,8 +18,10 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/hmac"
+	"crypto/rsa"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -32,27 +35,48 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/subtotalstew/gometrics.git/internal/audit"
+	"github.com/subtotalstew/gometrics.git/internal/crypto"
 	"github.com/subtotalstew/gometrics.git/internal/hash"
 	"github.com/subtotalstew/gometrics.git/internal/models"
 	"github.com/subtotalstew/gometrics.git/internal/storage"
 )
 
 // Handler обслуживает HTTP-запросы сервиса метрик. Он хранит ссылку на
-// хранилище, необязательные зависимости (колбэк синхронного сохранения,
-// соединение с БД, ключ подписи, издатель аудита) и не содержит
-// изменяемого состояния после настройки.
+// хранилище и необязательные зависимости (колбэк синхронного сохранения,
+// соединение с БД, ключ подписи, ключ расшифрования, издатель аудита)
+// и не содержит изменяемого состояния после настройки.
 type Handler struct {
-	storage  storage.Storage
-	syncSave func()
-	db       *sql.DB
-	key      string
-	audit    *audit.Subject
+	storage   storage.Storage
+	syncSave  func()
+	db        *sql.DB
+	key       string
+	cryptoKey *rsa.PrivateKey
+	audit     *audit.Subject
 }
 
 // SetKey задаёт ключ подписи HMAC-SHA256. Пока ключ не задан,
 // HashMiddleware пропускает запросы без проверки подписи.
 func (h *Handler) SetKey(key string) {
 	h.key = key
+}
+
+// SetCryptoKey включает расшифрование тел запросов: приватный ключ читается
+// из файла по пути path. Пустой path оставляет расшифрование выключенным.
+//
+// Ключ читается один раз при настройке, поэтому опечатка в пути даёт ошибку
+// при старте сервера, а не на первом запросе агента.
+func (h *Handler) SetCryptoKey(path string) error {
+	if path == "" {
+		h.cryptoKey = nil
+		return nil
+	}
+
+	privateKey, err := crypto.LoadPrivateKey(path)
+	if err != nil {
+		return fmt.Errorf("handler: %w", err)
+	}
+	h.cryptoKey = privateKey
+	return nil
 }
 
 // NewHandler создаёт хендлер поверх указанного хранилища метрик.
@@ -689,6 +713,62 @@ func (h *Handler) HashMiddleware(next http.Handler) http.Handler {
 		next.ServeHTTP(hrw, r)
 
 		hrw.finalize()
+	})
+}
+
+// DecryptMiddleware расшифровывает тело запроса ключом, заданным в
+// SetCryptoKey. Агент шифрует тело публичным ключом, сервер расшифровывает
+// его приватным.
+//
+// Middleware включается первым в цепочке после проверки подписи и до
+// GzipMiddleware: подпись считается по тому, что пришло по сети (по
+// шифртексту), а распаковка gzip — уже по расшифрованному телу.
+//
+// Если ключ не задан, middleware ничего не делает и запросы проходят как
+// раньше. Если ключ задан, запрос с непустым телом обязан быть зашифрованным
+// конвертом, иначе — 400.
+func (h *Handler) DecryptMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if h.cryptoKey == nil || r.Body == nil || r.Body == http.NoBody {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "failed to read body", http.StatusInternalServerError)
+			return
+		}
+
+		// Запросы без тела (GET /, /ping, POST /update/{type}/{name}/{value})
+		// шифровать нечего — пропускаем их без изменений.
+		if len(body) == 0 {
+			r.Body = http.NoBody
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		decrypted, err := crypto.Decrypt(h.cryptoKey, body)
+		if err != nil {
+			if errors.Is(err, crypto.ErrNotEnvelope) {
+				log.Warn().
+					Str("path", r.URL.Path).
+					Str("remote_addr", r.RemoteAddr).
+					Msg("request body is not encrypted")
+			} else {
+				log.Error().
+					Err(err).
+					Str("path", r.URL.Path).
+					Str("remote_addr", r.RemoteAddr).
+					Msg("failed to decrypt request body")
+			}
+			http.Error(w, "failed to decrypt body", http.StatusBadRequest)
+			return
+		}
+
+		r.Body = io.NopCloser(bytes.NewReader(decrypted))
+		r.ContentLength = int64(len(decrypted))
+		next.ServeHTTP(w, r)
 	})
 }
 

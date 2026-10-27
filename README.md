@@ -2,9 +2,11 @@
 
 Сервис сбора метрик и алертинга: HTTP-сервер (`cmd/server`) принимает метрики от
 агента (`cmd/agent`), хранит их в памяти, в файле или в PostgreSQL и отдаёт по
-запросу. Поддерживаются сжатие gzip, подпись HMAC-SHA256 и аудит.
+запросу. Поддерживаются сжатие gzip, подпись HMAC-SHA256, асимметричное
+шифрование тела запроса и аудит.
 
 - [Запуск](#запуск)
+- [Асимметричное шифрование](#асимметричное-шифрование)
 - [Сборка с версией](#сборка-с-версией)
 - [Тесты и покрытие](#тесты-и-покрытие)
 - [Бенчмарки](#бенчмарки)
@@ -23,6 +25,49 @@ go run ./cmd/server -a=localhost:8080 -f= -i=300 -pprof-addr=localhost:6060
 # агент
 go run ./cmd/agent -a=localhost:8080 -p=2 -r=10
 ```
+
+## Асимметричное шифрование
+
+Тело запроса агент шифрует публичным ключом, сервер расшифровывает его
+приватным. Ключи задаются путём до PEM-файла:
+
+| | флаг | переменная окружения | ключ |
+|---|---|---|---|
+| агент | `-crypto-key` | `CRYPTO_KEY` | публичный |
+| сервер | `-crypto-key` | `CRYPTO_KEY` | приватный |
+
+```bash
+# 1. Пара ключей. OpenSSL 3.x пишет PKCS#8; поддерживаются также PKCS#1
+#    («BEGIN RSA PRIVATE KEY») и PKIX («BEGIN PUBLIC KEY»).
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out private.pem
+openssl rsa -in private.pem -pubout -out public.pem
+
+# 2. Сервер с приватным ключом
+go run ./cmd/server -a=localhost:8080 -crypto-key=private.pem
+
+# 3. Агент с публичным ключом (через флаг или переменную окружения)
+CRYPTO_KEY=public.pem go run ./cmd/agent -a=localhost:8080
+```
+
+Как это устроено:
+
+- шифруется только тело запроса; URL и заголовки остаются открытыми;
+- схема гибридная: тело шифруется AES-256-GCM, а одноразовый ключ AES
+  упаковывается RSA-OAEP/SHA-256. Прямое RSA-шифрование тела невозможно:
+  блок RSA-2048 вмещает не более 245 байт открытого текста, а батч метрик
+  больше;
+- порядок обработки на сервере: проверка `HashSHA256` (подпись считается по
+  шифртексту, то есть по тому, что реально пришло по сети) → расшифрование →
+  распаковка gzip → разбор JSON;
+- ключ читается один раз при старте, поэтому ошибка в пути или битый файл
+  останавливают агент/сервер сразу, а не ломают каждый батч;
+- если сервер запущен с `-crypto-key`, запросы с непустым телом, не являющиеся
+  конвертом, отклоняются с 400. Запросы без тела (`GET /`, `GET /ping`,
+  `POST /update/{type}/{name}/{value}`) работают как раньше;
+- без ключа на обеих сторонах поведение прежнее: тело уходит открытым gzip.
+
+Реализация — пакет `internal/crypto`; формат конверта описан в его
+doc-комментарии.
 
 ## Сборка с версией
 
@@ -118,19 +163,29 @@ go test ./... -count=1 -coverprofile=coverage.out
 go tool cover -func=coverage.out | tail -1
 ```
 
-Текущее покрытие — **44.1%** (требование спринта — не менее 40%):
+Текущее покрытие — **64.2%** (требование спринта — не менее 40%):
 
 ```
-github.com/subtotalstew/gometrics.git/internal/agent     23.1%
-github.com/subtotalstew/gometrics.git/internal/audit     61.9%
-github.com/subtotalstew/gometrics.git/internal/handler   52.7%
-github.com/subtotalstew/gometrics.git/internal/hash     100.0%
-github.com/subtotalstew/gometrics.git/internal/loadgen   85.3%
-github.com/subtotalstew/gometrics.git/internal/profiler 100.0%
-github.com/subtotalstew/gometrics.git/internal/retry     53.8%
-github.com/subtotalstew/gometrics.git/internal/storage   52.1%
-total:                                                  44.1%
+github.com/subtotalstew/gometrics.git/cmd/agent                   65.5%
+github.com/subtotalstew/gometrics.git/cmd/reset                    0.0%
+github.com/subtotalstew/gometrics.git/cmd/server                  39.5%
+github.com/subtotalstew/gometrics.git/cmd/staticlint               0.0%
+github.com/subtotalstew/gometrics.git/internal/agent              66.7%
+github.com/subtotalstew/gometrics.git/internal/analysis/noosexit  82.5%
+github.com/subtotalstew/gometrics.git/internal/audit              92.3%
+github.com/subtotalstew/gometrics.git/internal/crypto             90.7%
+github.com/subtotalstew/gometrics.git/internal/handler            78.8%
+github.com/subtotalstew/gometrics.git/internal/hash              100.0%
+github.com/subtotalstew/gometrics.git/internal/loadgen            85.3%
+github.com/subtotalstew/gometrics.git/internal/pool              100.0%
+github.com/subtotalstew/gometrics.git/internal/profiler          100.0%
+github.com/subtotalstew/gometrics.git/internal/retry              53.8%
+github.com/subtotalstew/gometrics.git/internal/storage            61.2%
+total:                                                            64.2%
 ```
+
+`cmd/reset` и `cmd/staticlint` — утилиты без тестов; `internal/models` содержит только
+объявления структур, поэтому в отчёте он отсутствует.
 
 ## Бенчмарки
 

@@ -43,6 +43,7 @@ type config struct {
 	restore       bool
 	databaseDSN   string
 	key           string
+	cryptoKey     string
 	auditFile     string
 	auditURL      string
 	pprofAddr     string
@@ -95,6 +96,7 @@ func loadConfigFrom(fs *flag.FlagSet) (config, error) {
 	fs.BoolVar(&cfg.restore, "r", true, "whether to restore previously saved metrics on start")
 	fs.StringVar(&cfg.databaseDSN, "d", "", "database connection string")
 	fs.StringVar(&cfg.key, "k", "", "key for decrypt")
+	fs.StringVar(&cfg.cryptoKey, "crypto-key", "", "path to private key file for asymmetric decryption")
 	fs.StringVar(&cfg.auditFile, "audit-file", "", "path to audit log file")
 	fs.StringVar(&cfg.auditURL, "audit-url", "", "URL for audit log delivery")
 	fs.StringVar(&cfg.pprofAddr, "pprof-addr", "", "address of the pprof/debug HTTP server (empty = disabled)")
@@ -129,6 +131,9 @@ func loadConfigFrom(fs *flag.FlagSet) (config, error) {
 	if v := os.Getenv("KEY"); v != "" {
 		cfg.key = v
 	}
+	if v := os.Getenv("CRYPTO_KEY"); v != "" {
+		cfg.cryptoKey = v
+	}
 	if v := os.Getenv("AUDIT_FILE"); v != "" {
 		cfg.auditFile = v
 	}
@@ -143,6 +148,11 @@ func loadConfigFrom(fs *flag.FlagSet) (config, error) {
 
 // buildRouter собирает chi-роутер с полным стеком middleware.
 // Вынесено из serve(), чтобы тестировать маршрутизацию без запуска сервера.
+//
+// Порядок middleware важен: подпись проверяется по байтам, пришедшим по сети
+// (по шифртексту), затем тело расшифровывается приватным ключом, и только
+// после этого распаковывается gzip. Ключ расшифрования задаётся в serve через
+// handler.SetCryptoKey; без ключа DecryptMiddleware ничего не делает.
 func buildRouter(h *handler.Handler, key string) *chi.Mux {
 	r := chi.NewRouter()
 
@@ -150,6 +160,7 @@ func buildRouter(h *handler.Handler, key string) *chi.Mux {
 		h.SetKey(key)
 		r.Use(h.HashMiddleware)
 	}
+	r.Use(h.DecryptMiddleware)
 	r.Use(h.GzipMiddleware)
 	r.Use(h.LoggingMiddleware)
 	r.Use(middleware.Recoverer)
@@ -218,6 +229,15 @@ func serve(cfg config) error {
 	}
 
 	h := handler.NewHandler(metricsStorage)
+
+	// Приватный ключ читается на старте: опечатка в пути или битый файл
+	// должны останавливать сервер сразу, а не ломать каждый батч агента.
+	if cfg.cryptoKey != "" {
+		if err := h.SetCryptoKey(cfg.cryptoKey); err != nil {
+			return fmt.Errorf("не удалось загрузить приватный ключ: %w", err)
+		}
+		log.Info().Str("key", cfg.cryptoKey).Msg("асимметричное шифрование: включено")
+	}
 
 	// Аудит включается, только если задан хотя бы один приёмник.
 	if cfg.auditFile != "" || cfg.auditURL != "" {
