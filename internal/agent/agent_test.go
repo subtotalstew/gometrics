@@ -3,7 +3,6 @@ package agent
 import (
 	"bytes"
 	"compress/gzip"
-	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -129,7 +128,7 @@ func TestEnqueueMetrics(t *testing.T) {
 	a.collector.UpdateMetrics()
 
 	jobs := make(chan []models.Metrics, 1)
-	a.enqueueMetrics(context.Background(), jobs)
+	a.enqueueMetrics(jobs)
 
 	select {
 	case batch := <-jobs:
@@ -141,27 +140,40 @@ func TestEnqueueMetrics(t *testing.T) {
 	}
 }
 
-// TestEnqueueMetrics_ContextCancelled проверяет, что при отменённом
-// контексте enqueueMetrics не блокируется.
-func TestEnqueueMetrics_ContextCancelled(t *testing.T) {
+// TestEnqueueMetrics_NotDropped проверяет, что батч не теряется при
+// остановке агента: отправка в очередь не прерывается контекстом, а ждёт
+// воркера, который его заберёт.
+func TestEnqueueMetrics_NotDropped(t *testing.T) {
 	a := NewAgent("http://127.0.0.1:1", 1, 1, 1, "")
 	a.collector.UpdateMetrics()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // сразу отменён
-
-	jobs := make(chan []models.Metrics) // без буфера, никто не читает
+	jobs := make(chan []models.Metrics) // без буфера, читателя ещё нет
 
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		a.enqueueMetrics(ctx, jobs)
+		a.enqueueMetrics(jobs)
 	}()
 
 	select {
 	case <-done:
+		t.Fatal("enqueueMetrics returned before a worker took the batch")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	select {
+	case batch := <-jobs:
+		if len(batch) == 0 {
+			t.Error("dropped batch is empty")
+		}
 	case <-time.After(time.Second):
-		t.Fatal("enqueueMetrics blocked on cancelled context")
+		t.Fatal("no batch enqueued")
+	}
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("enqueueMetrics blocked after the batch was taken")
 	}
 }
 

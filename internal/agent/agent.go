@@ -217,10 +217,15 @@ func (a *Agent) SetCryptoKey(path string) error {
 	return nil
 }
 
-// Run запускает агент и блокируется до получения SIGINT/SIGTERM.
+// Run запускает агент и блокируется до получения SIGINT, SIGTERM или SIGQUIT.
 // Внутри поднимаются три горутины-поллера (runtime, gopsutil, отправка)
 // и пул из rateLimit воркеров; при завершении они останавливаются
 // по контексту, а очередь отправки закрывается.
+//
+// По сигналу агент не теряет уже собранные данные: поллеры
+// останавливаются, последний снимок метрик досылается в очередь,
+// и только после того, как воркеры отработают все батчи (включая
+// повторы), Run возвращает управление.
 func (a *Agent) Run() {
 	log.Info().
 		Int("poll_interval", a.pollInterval).
@@ -232,7 +237,7 @@ func (a *Agent) Run() {
 	defer cancel()
 
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 
 	jobs := make(chan []models.Metrics, a.rateLimit)
 
@@ -253,12 +258,22 @@ func (a *Agent) Run() {
 	pollersWG.Add(1)
 	go a.runReporter(ctx, jobs, &pollersWG)
 
-	<-sigChan
-	log.Info().Msg("agent shutting down gracefully")
+	sig := <-sigChan
+	// Снимаем обработчик: повторный сигнал завершит процесс сразу,
+	// не дожидаясь, пока воркеры доработают повторы.
+	signal.Stop(sigChan)
+	log.Info().Str("signal", sig.String()).Msg("agent shutting down gracefully")
 
+	// 1. Останавливаем поллеры: новых снимков метрик больше не будет.
 	cancel()
 	pollersWG.Wait()
 
+	// 2. Досылаем последний снимок: данные, собранные между двумя
+	//    отчётами, иначе потерялись бы вместе с процессом.
+	a.enqueueMetrics(jobs)
+
+	// 3. Закрываем очередь: воркеры отправят всё уже поставленное
+	//    (с повторами при временных ошибках) и только потом завершатся.
 	close(jobs)
 	workersWG.Wait()
 
@@ -317,14 +332,17 @@ func (a *Agent) runReporter(ctx context.Context, jobs chan<- []models.Metrics, w
 	for {
 		select {
 		case <-ticker.C:
-			a.enqueueMetrics(ctx, jobs)
+			a.enqueueMetrics(jobs)
 		case <-ctx.Done():
 			return
 		}
 	}
 }
 
-func (a *Agent) enqueueMetrics(ctx context.Context, jobs chan<- []models.Metrics) {
+// enqueueMetrics ставит в очередь снимок текущих метрик. Отправка в jobs
+// не прерывается контекстом: воркеры живут до close(jobs), поэтому батч,
+// сформированный в момент получения сигнала, всегда будет доставлен.
+func (a *Agent) enqueueMetrics(jobs chan<- []models.Metrics) {
 	gauges := a.collector.GetGauge()
 	counters := a.collector.GetCounter()
 
@@ -353,10 +371,7 @@ func (a *Agent) enqueueMetrics(ctx context.Context, jobs chan<- []models.Metrics
 		return
 	}
 
-	select {
-	case jobs <- metrics:
-	case <-ctx.Done():
-	}
+	jobs <- metrics
 }
 
 func (a *Agent) worker(id int, jobs <-chan []models.Metrics, wg *sync.WaitGroup) {

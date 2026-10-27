@@ -35,6 +35,11 @@ var (
 	buildCommit  = "N/A"
 )
 
+// shutdownTimeout — сколько ждём завершения уже начатых HTTP-запросов при
+// остановке. Это время нужно, чтобы их данные успели дойти до хранилища
+// до финального сохранения.
+const shutdownTimeout = 10 * time.Second
+
 // config — параметры запуска сервера.
 type config struct {
 	configPath    string
@@ -65,7 +70,7 @@ func printBuildInfo() {
 }
 
 // run загружает конфигурацию, собирает зависимости, запускает сервер
-// и блокируется до получения SIGINT/SIGTERM.
+// и блокируется до получения SIGINT/SIGTERM/SIGQUIT.
 func run() error {
 	cfg, err := loadConfig()
 	if err != nil {
@@ -283,6 +288,18 @@ func serve(cfg config) error {
 
 	var stop, done chan struct{}
 
+	// stopPeriodic останавливает фоновое сохранение и ждёт, пока текущая
+	// запись на диск закончится. Повторный вызов ничего не делает.
+	stopPeriodic := func() {
+		if stop == nil {
+			return
+		}
+		close(stop)
+		<-done
+		stop = nil
+	}
+	defer stopPeriodic()
+
 	if cfg.databaseDSN == "" && cfg.filePath != "" {
 		if memStorage, ok := metricsStorage.(*storage.MemStorage); ok {
 			if cfg.storeInterval == 0 {
@@ -305,34 +322,52 @@ func serve(cfg config) error {
 	r := buildRouter(h, cfg.key)
 	srv := &http.Server{Addr: cfg.addr, Handler: r}
 
+	// Ошибка запуска (например, занятый порт) не должна оставлять процесс
+	// висеть в ожидании сигнала.
+	srvErr := make(chan error, 1)
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Error().Err(err).Msg("HTTP-сервер завершился с ошибкой")
+			srvErr <- err
 		}
 	}()
 
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	<-sigChan
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 
-	log.Info().Msg("shutting down")
-
-	if stop != nil {
-		close(stop)
-		<-done
+	select {
+	case sig := <-sigChan:
+		// Снимаем обработчик: повторный сигнал завершит процесс сразу,
+		// не дожидаясь, пока доработают активные запросы.
+		signal.Stop(sigChan)
+		log.Info().Str("signal", sig.String()).Msg("получен сигнал завершения")
+	case err := <-srvErr:
+		signal.Stop(sigChan)
+		return fmt.Errorf("HTTP-сервер не смог запуститься: %w", err)
 	}
 
+	// 1. Перестаём принимать новые запросы и дожидаемся уже начатых:
+	//    их данные ещё должны попасть в хранилище. Финальное сохранение
+	//    имеет смысл только после этого шага.
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Error().Err(err).Msg("не удалось дождаться активных запросов, закрываем соединения принудительно")
+		_ = srv.Close()
+	}
+
+	// 2. Останавливаем фоновое сохранение: дальше файл пишем только мы.
+	stopPeriodic()
+
+	// 3. Сохраняем всё, что осталось в памяти, включая данные запросов,
+	//    обслуженных во время остановки.
 	if cfg.databaseDSN == "" && cfg.filePath != "" {
 		if memStorage, ok := metricsStorage.(*storage.MemStorage); ok {
 			if err := storage.SaveToFile(memStorage, cfg.filePath); err != nil {
-				log.Error().Err(err).Msg("не удалось сохранить метрики при завершении работы")
+				return fmt.Errorf("не удалось сохранить метрики при завершении работы: %w", err)
 			}
+			log.Info().Str("path", cfg.filePath).Msg("метрики сохранены при завершении работы")
 		}
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	_ = srv.Shutdown(ctx)
 
 	return nil
 }
