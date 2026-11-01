@@ -172,9 +172,9 @@ func newAEAD(cek []byte) (cipher.AEAD, error) {
 // Поддерживаются оба распространённых формата: PKIX («PUBLIC KEY», его пишет
 // `openssl rsa -pubout`) и PKCS#1 («RSA PUBLIC KEY»).
 func LoadPublicKey(path string) (*rsa.PublicKey, error) {
-	block, err := readPEMBlock(path, "публичным")
+	block, err := readPEMBlock(path)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("crypto: публичный ключ: %w", err)
 	}
 
 	if parsed, err := x509.ParsePKIXPublicKey(block.Bytes); err == nil {
@@ -200,9 +200,9 @@ func LoadPublicKey(path string) (*rsa.PublicKey, error) {
 // Поддерживаются PKCS#1 («RSA PRIVATE KEY») и PKCS#8 («PRIVATE KEY») — второй
 // формат по умолчанию пишут OpenSSL 3.x и `openssl genpkey`.
 func LoadPrivateKey(path string) (*rsa.PrivateKey, error) {
-	block, err := readPEMBlock(path, "приватным")
+	block, err := readPEMBlock(path)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("crypto: приватный ключ: %w", err)
 	}
 
 	if priv, err := x509.ParsePKCS1PrivateKey(block.Bytes); err == nil {
@@ -225,20 +225,23 @@ func LoadPrivateKey(path string) (*rsa.PrivateKey, error) {
 }
 
 // readPEMBlock читает файл по пути path и возвращает первый PEM-блок.
-// forKey подставляется в сообщения об ошибках («с публичным ключом» и т. п.).
-func readPEMBlock(path string, forKey string) (*pem.Block, error) {
+//
+// Ошибки нейтральны по отношению к типу ключа: контекст («публичный ключ»,
+// «приватный ключ») добавляет вызывающий код через %w. Поэтому здесь нет
+// склейки строк вида "файл с " + forKey + " ключом".
+func readPEMBlock(path string) (*pem.Block, error) {
 	if strings.TrimSpace(path) == "" {
-		return nil, errors.New("crypto: путь к файлу с " + forKey + " ключом не задан")
+		return nil, errors.New("путь к файлу с ключом не задан")
 	}
 
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("crypto: не удалось прочитать файл с %s ключом %q: %w", forKey, path, err)
+		return nil, fmt.Errorf("не удалось прочитать файл %q: %w", path, err)
 	}
 
 	block, _ := pem.Decode(data)
 	if block == nil {
-		return nil, fmt.Errorf("crypto: файл %q не содержит PEM-блока", path)
+		return nil, fmt.Errorf("файл %q не содержит PEM-блока", path)
 	}
 	return block, nil
 }

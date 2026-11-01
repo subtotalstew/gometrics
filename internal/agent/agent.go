@@ -17,6 +17,7 @@ import (
 	"os/signal"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -173,6 +174,15 @@ type Agent struct {
 	key            string
 	pubKey         *rsa.PublicKey
 	client         *http.Client
+
+	// dirty — были ли измерения после последнего снимка, поставленного
+	// в очередь отправки. Нужен, чтобы при остановке не отправлять
+	// повторно то, что уже ушло на сервер.
+	dirty atomic.Bool
+
+	// flushTimeout ограничивает ожидание свободного воркера при
+	// завершающем сбросе снимка; по умолчанию defaultFlushTimeout.
+	flushTimeout time.Duration
 }
 
 // NewAgent создаёт агент, который опрашивает метрики каждые pollInterval
@@ -194,6 +204,7 @@ func NewAgent(serverAddr string, pollInterval, reportInterval, rateLimit int, ke
 		rateLimit:      rateLimit,
 		key:            key,
 		client:         &http.Client{Timeout: 5 * time.Second},
+		flushTimeout:   defaultFlushTimeout,
 	}
 }
 
@@ -217,15 +228,25 @@ func (a *Agent) SetCryptoKey(path string) error {
 	return nil
 }
 
+// defaultFlushTimeout — сколько агент готов ждать свободного воркера, чтобы
+// поставить в очередь завершающий батч при остановке. Больше ждать нет
+// смысла: если воркеры заняты ретраями, сервер, скорее всего, недоступен.
+const defaultFlushTimeout = 10 * time.Second
+
 // Run запускает агент и блокируется до получения SIGINT, SIGTERM или SIGQUIT.
 // Внутри поднимаются три горутины-поллера (runtime, gopsutil, отправка)
 // и пул из rateLimit воркеров; при завершении они останавливаются
 // по контексту, а очередь отправки закрывается.
 //
-// По сигналу агент не теряет уже собранные данные: поллеры
-// останавливаются, последний снимок метрик досылается в очередь,
-// и только после того, как воркеры отработают все батчи (включая
-// повторы), Run возвращает управление.
+// По сигналу агент не теряет уже собранные данные, но время завершения
+// остаётся предсказуемым:
+//
+//   - поллеры останавливаются;
+//   - последний снимок досылается в очередь с ожиданием не дольше
+//     flushTimeout (если все воркеры заняты долгими ретраями, снимок
+//     пропускается с предупреждением — иначе Run висел бы навсегда);
+//   - батчи, уже принятые воркерами, дорабатываются до конца, включая
+//     повторы при временных ошибках: это данные, которые были в обработке.
 func (a *Agent) Run() {
 	log.Info().
 		Int("poll_interval", a.pollInterval).
@@ -269,8 +290,9 @@ func (a *Agent) Run() {
 	pollersWG.Wait()
 
 	// 2. Досылаем последний снимок: данные, собранные между двумя
-	//    отчётами, иначе потерялись бы вместе с процессом.
-	a.enqueueMetrics(jobs)
+	//    отчётами, иначе потерялись бы вместе с процессом. Ожидание
+	//    свободного воркера ограничено flushTimeout — см. flushMetrics.
+	a.flushMetrics(jobs)
 
 	// 3. Закрываем очередь: воркеры отправят всё уже поставленное
 	//    (с повторами при временных ошибках) и только потом завершатся.
@@ -287,11 +309,13 @@ func (a *Agent) runRuntimePoller(ctx context.Context, wg *sync.WaitGroup) {
 	defer ticker.Stop()
 
 	a.collector.UpdateMetrics()
+	a.dirty.Store(true)
 
 	for {
 		select {
 		case <-ticker.C:
 			a.collector.UpdateMetrics()
+			a.dirty.Store(true)
 			log.Debug().Msg("runtime metrics updated")
 		case <-ctx.Done():
 			return
@@ -307,6 +331,8 @@ func (a *Agent) runPSUtilPoller(ctx context.Context, wg *sync.WaitGroup) {
 
 	if err := a.collector.UpdatePSUtilMetrics(); err != nil {
 		log.Error().Err(err).Msg("failed to collect gopsutil metrics")
+	} else {
+		a.dirty.Store(true)
 	}
 
 	for {
@@ -316,6 +342,7 @@ func (a *Agent) runPSUtilPoller(ctx context.Context, wg *sync.WaitGroup) {
 				log.Error().Err(err).Msg("failed to collect gopsutil metrics")
 				continue
 			}
+			a.dirty.Store(true)
 			log.Debug().Msg("gopsutil metrics updated")
 		case <-ctx.Done():
 			return
@@ -343,6 +370,51 @@ func (a *Agent) runReporter(ctx context.Context, jobs chan<- []models.Metrics, w
 // не прерывается контекстом: воркеры живут до close(jobs), поэтому батч,
 // сформированный в момент получения сигнала, всегда будет доставлен.
 func (a *Agent) enqueueMetrics(jobs chan<- []models.Metrics) {
+	// Флаг «есть неотправленное» снимаем до сборки снимка: если поллер
+	// успеет обновить метрики между сборкой и отправкой, флаг поднимется
+	// снова, и при остановке эти данные всё равно будут досланы.
+	a.dirty.Store(false)
+
+	metrics := a.buildBatch()
+	if len(metrics) == 0 {
+		log.Debug().Msg("нет метрик для отправки, батч пропущен")
+		return
+	}
+
+	jobs <- metrics
+}
+
+// flushMetrics досылает последний снимок метрик перед остановкой агента.
+//
+// Если после последнего поставленного в очередь снимка измерений не было
+// (dirty == false), отправлять нечего и flushMetrics не блокируется.
+// Ожидание свободного воркера ограничено flushTimeout: доставка данных
+// важнее скорости, но завершение не должно зависать навсегда, если все
+// воркеры заняты длинными ретраями.
+func (a *Agent) flushMetrics(jobs chan<- []models.Metrics) {
+	if !a.dirty.Load() {
+		log.Debug().Msg("нет неотправленных метрик, завершающий сброс не нужен")
+		return
+	}
+
+	metrics := a.buildBatch()
+	if len(metrics) == 0 {
+		return
+	}
+
+	select {
+	case jobs <- metrics:
+		log.Info().Int("count", len(metrics)).Msg("завершающий батч поставлен в очередь")
+	case <-time.After(a.flushTimeout):
+		log.Warn().
+			Int("count", len(metrics)).
+			Dur("timeout", a.flushTimeout).
+			Msg("не удалось поставить завершающий батч в очередь: воркеры заняты, снимок пропущен")
+	}
+}
+
+// buildBatch собирает снимок текущих метрик в батч для отправки.
+func (a *Agent) buildBatch() []models.Metrics {
 	gauges := a.collector.GetGauge()
 	counters := a.collector.GetCounter()
 
@@ -366,12 +438,7 @@ func (a *Agent) enqueueMetrics(jobs chan<- []models.Metrics) {
 		})
 	}
 
-	if len(metrics) == 0 {
-		log.Debug().Msg("нет метрик для отправки, батч пропущен")
-		return
-	}
-
-	jobs <- metrics
+	return metrics
 }
 
 func (a *Agent) worker(id int, jobs <-chan []models.Metrics, wg *sync.WaitGroup) {

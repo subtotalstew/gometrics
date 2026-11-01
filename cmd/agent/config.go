@@ -19,9 +19,11 @@ type fileConfig struct {
 }
 
 // applyFileConfig накладывает значения из файла на cfg.
-// set сообщает, задан ли флаг с таким именем явно: такие поля файл
-// не перекрывает. Переменные окружения применяются вызывающей стороной
-// уже после файла, поэтому env тоже побеждает.
+//
+// Механизм наложения живёт в internal/config: здесь остаётся только
+// описание полей агента и имён соответствующих флагов. set сообщает,
+// задан ли флаг явно: такие поля файл не перекрывает, а переменные
+// окружения применяются вызывающей стороной уже после файла.
 func applyFileConfig(cfg *config, path string, set func(name string) bool) error {
 	// Пустой path просто не читает файл.
 	var fc fileConfig
@@ -29,31 +31,13 @@ func applyFileConfig(cfg *config, path string, set func(name string) bool) error
 		return err
 	}
 
-	if fc.Address != nil && !set("a") {
-		cfg.addr = *fc.Address
+	fileconfig.ApplyIf(&cfg.addr, fc.Address, set, "a")
+	fileconfig.ApplyIf(&cfg.cryptoKey, fc.CryptoKey, set, "crypto-key")
+	fileconfig.ApplyIf(&cfg.key, fc.Key, set, "k")
+	fileconfig.ApplyIf(&cfg.rateLimit, fc.RateLimit, set, "l")
+
+	if err := fileconfig.ApplyValue(&cfg.reportInterval, fc.ReportInterval, set, "r", fileconfig.ParseSeconds); err != nil {
+		return err
 	}
-	if fc.ReportInterval != nil && !set("r") {
-		n, err := fileconfig.ParseSeconds(*fc.ReportInterval)
-		if err != nil {
-			return err
-		}
-		cfg.reportInterval = n
-	}
-	if fc.PollInterval != nil && !set("p") {
-		n, err := fileconfig.ParseSeconds(*fc.PollInterval)
-		if err != nil {
-			return err
-		}
-		cfg.pollInterval = n
-	}
-	if fc.CryptoKey != nil && !set("crypto-key") {
-		cfg.cryptoKey = *fc.CryptoKey
-	}
-	if fc.Key != nil && !set("k") {
-		cfg.key = *fc.Key
-	}
-	if fc.RateLimit != nil && !set("l") {
-		cfg.rateLimit = *fc.RateLimit
-	}
-	return nil
+	return fileconfig.ApplyValue(&cfg.pollInterval, fc.PollInterval, set, "p", fileconfig.ParseSeconds)
 }

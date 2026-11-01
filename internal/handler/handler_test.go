@@ -793,3 +793,45 @@ func TestDecryptMiddleware_FullChain(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, 10.25, val)
 }
+
+// TestDecryptMiddleware_RejectsOversizedBody проверяет, что слишком большое
+// тело отсекается лимитом до расшифрования, а не выделяется в память целиком.
+func TestDecryptMiddleware_RejectsOversizedBody(t *testing.T) {
+	priv := testPrivateKey(t)
+	h := NewHandler(storage.NewMemStorage())
+	require.NoError(t, h.SetCryptoKey(writePrivateKeyFile(t, "RSA PRIVATE KEY", x509.MarshalPKCS1PrivateKey(priv))))
+	r := cryptoRouter(h, "")
+
+	body := bytes.Repeat([]byte("a"), maxRequestBody+1)
+	req := httptest.NewRequest(http.MethodPost, "/updates/", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusRequestEntityTooLarge, w.Result().StatusCode)
+}
+
+// TestGzipMiddleware_RejectsOversizedDecompressedBody проверяет, что лимит
+// применяется и к распакованному телу: «gzip-бомба» не доходит до хендлера.
+func TestGzipMiddleware_RejectsOversizedDecompressedBody(t *testing.T) {
+	h := NewHandler(storage.NewMemStorage())
+
+	// Цепочка как у сервера, включая LoggingMiddleware, который читает тело.
+	router := chi.NewRouter()
+	router.Use(h.DecryptMiddleware)
+	router.Use(h.GzipMiddleware)
+	router.Use(h.LoggingMiddleware)
+	router.Post("/updates/", h.UpdatesJSONHandler)
+
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	_, err := zw.Write(bytes.Repeat([]byte(" "), maxRequestBody+1))
+	require.NoError(t, err)
+	require.NoError(t, zw.Close())
+
+	req := httptest.NewRequest(http.MethodPost, "/updates/", &buf)
+	req.Header.Set("Content-Encoding", "gzip")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusRequestEntityTooLarge, w.Result().StatusCode)
+}

@@ -24,6 +24,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/subtotalstew/gometrics.git/internal/audit"
+	fileconfig "github.com/subtotalstew/gometrics.git/internal/config"
 	"github.com/subtotalstew/gometrics.git/internal/handler"
 	"github.com/subtotalstew/gometrics.git/internal/profiler"
 	"github.com/subtotalstew/gometrics.git/internal/storage"
@@ -114,17 +115,13 @@ func loadConfigFrom(fs *flag.FlagSet) (config, error) {
 		return config{}, err
 	}
 
-	// Запоминаем явно заданные флаги: их значения файл не перекрывает.
-	explicit := make(map[string]bool, fs.NFlag())
-	fs.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
-
 	// CONFIG задаёт путь к файлу и, как и остальные env, приоритетнее флага.
 	if v := os.Getenv("CONFIG"); v != "" {
 		cfg.configPath = v
 	}
-	if err := applyFileConfig(&cfg, cfg.configPath, func(name string) bool {
-		return explicit[name]
-	}); err != nil {
+	// fileconfig.ExplicitFlags учитывает флаги, заданные явно: их значения
+	// файл не перекрывает.
+	if err := applyFileConfig(&cfg, cfg.configPath, fileconfig.ExplicitFlags(fs)); err != nil {
 		return config{}, err
 	}
 

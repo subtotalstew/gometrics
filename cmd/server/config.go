@@ -23,9 +23,11 @@ type fileConfig struct {
 }
 
 // applyFileConfig накладывает значения из файла на cfg.
-// set сообщает, задан ли флаг с таким именем явно: такие поля файл
-// не перекрывает. Переменные окружения применяются вызывающей стороной
-// уже после файла, поэтому env тоже побеждает.
+//
+// Механизм наложения живёт в internal/config: здесь остаётся только
+// описание полей сервера и имён соответствующих флагов. set сообщает,
+// задан ли флаг явно: такие поля файл не перекрывает, а переменные
+// окружения применяются вызывающей стороной уже после файла.
 func applyFileConfig(cfg *config, path string, set func(name string) bool) error {
 	// Пустой path просто не читает файл.
 	var fc fileConfig
@@ -33,39 +35,18 @@ func applyFileConfig(cfg *config, path string, set func(name string) bool) error
 		return err
 	}
 
-	if fc.Address != nil && !set("a") {
-		cfg.addr = *fc.Address
-	}
-	if fc.Restore != nil && !set("r") {
-		cfg.restore = *fc.Restore
-	}
-	if fc.StoreInterval != nil && !set("i") {
-		n, err := fileconfig.ParseSeconds(*fc.StoreInterval)
-		if err != nil {
-			return err
-		}
-		cfg.storeInterval = n
-	}
-	if fc.StoreFile != nil && !set("f") {
-		cfg.filePath = *fc.StoreFile
-	}
-	if fc.DatabaseDSN != nil && !set("d") {
-		cfg.databaseDSN = *fc.DatabaseDSN
-	}
-	if fc.CryptoKey != nil && !set("crypto-key") {
-		cfg.cryptoKey = *fc.CryptoKey
-	}
-	if fc.Key != nil && !set("k") {
-		cfg.key = *fc.Key
-	}
-	if fc.AuditFile != nil && !set("audit-file") {
-		cfg.auditFile = *fc.AuditFile
-	}
-	if fc.AuditURL != nil && !set("audit-url") {
-		cfg.auditURL = *fc.AuditURL
-	}
-	if fc.PprofAddr != nil && !set("pprof-addr") {
-		cfg.pprofAddr = *fc.PprofAddr
-	}
-	return nil
+	fileconfig.ApplyIf(&cfg.addr, fc.Address, set, "a")
+	fileconfig.ApplyIf(&cfg.restore, fc.Restore, set, "r")
+	fileconfig.ApplyIf(&cfg.filePath, fc.StoreFile, set, "f")
+	fileconfig.ApplyIf(&cfg.databaseDSN, fc.DatabaseDSN, set, "d")
+	fileconfig.ApplyIf(&cfg.cryptoKey, fc.CryptoKey, set, "crypto-key")
+	fileconfig.ApplyIf(&cfg.key, fc.Key, set, "k")
+	fileconfig.ApplyIf(&cfg.auditFile, fc.AuditFile, set, "audit-file")
+	fileconfig.ApplyIf(&cfg.auditURL, fc.AuditURL, set, "audit-url")
+	fileconfig.ApplyIf(&cfg.pprofAddr, fc.PprofAddr, set, "pprof-addr")
+
+	// store_interval: 0 — особое значение (синхронное сохранение),
+	// поэтому разбирается отдельным парсером, который не пропускает
+	// субсекундные длительности.
+	return fileconfig.ApplyValue(&cfg.storeInterval, fc.StoreInterval, set, "i", fileconfig.ParseStoreInterval)
 }

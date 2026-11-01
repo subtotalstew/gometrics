@@ -126,6 +126,7 @@ func TestCheckResponse(t *testing.T) {
 func TestEnqueueMetrics(t *testing.T) {
 	a := NewAgent("http://127.0.0.1:1", 1, 1, 1, "")
 	a.collector.UpdateMetrics()
+	a.dirty.Store(true)
 
 	jobs := make(chan []models.Metrics, 1)
 	a.enqueueMetrics(jobs)
@@ -137,6 +138,10 @@ func TestEnqueueMetrics(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("no batch enqueued within 1s")
+	}
+
+	if a.dirty.Load() {
+		t.Error("dirty = true, want false: снимок уже поставлен в очередь")
 	}
 }
 
@@ -174,6 +179,66 @@ func TestEnqueueMetrics_NotDropped(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("enqueueMetrics blocked after the batch was taken")
+	}
+}
+
+// TestFlushMetrics_SendsLastSnapshot проверяет, что при остановке агент
+// досылает снимок, который ещё не уходил на сервер.
+func TestFlushMetrics_SendsLastSnapshot(t *testing.T) {
+	a := NewAgent("http://127.0.0.1:1", 1, 1, 1, "")
+	a.collector.UpdateMetrics()
+	a.dirty.Store(true)
+
+	jobs := make(chan []models.Metrics, 1)
+	a.flushMetrics(jobs)
+
+	select {
+	case batch := <-jobs:
+		if len(batch) == 0 {
+			t.Error("flushed batch is empty")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("flushMetrics did not enqueue the last snapshot")
+	}
+}
+
+// TestFlushMetrics_SkipsAlreadySentSnapshot проверяет, что снимок, уже
+// отправленный прошлым отчётом, повторно не отправляется.
+func TestFlushMetrics_SkipsAlreadySentSnapshot(t *testing.T) {
+	a := NewAgent("http://127.0.0.1:1", 1, 1, 1, "")
+	a.collector.UpdateMetrics()
+	a.dirty.Store(false) // после последнего снимка измерений не было
+
+	jobs := make(chan []models.Metrics, 1)
+	a.flushMetrics(jobs)
+
+	select {
+	case <-jobs:
+		t.Fatal("flushMetrics enqueued a batch that was already sent")
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+// TestFlushMetrics_Timeout проверяет, что завершающий сброс не блокирует
+// остановку агента навсегда, если все воркеры заняты.
+func TestFlushMetrics_Timeout(t *testing.T) {
+	a := NewAgent("http://127.0.0.1:1", 1, 1, 1, "")
+	a.collector.UpdateMetrics()
+	a.dirty.Store(true)
+	a.flushTimeout = 20 * time.Millisecond
+
+	jobs := make(chan []models.Metrics) // без буфера и без читателя
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		a.flushMetrics(jobs)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("flushMetrics blocked longer than its timeout")
 	}
 }
 

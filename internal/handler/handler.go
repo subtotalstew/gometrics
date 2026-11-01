@@ -367,7 +367,12 @@ func (h *Handler) LoggingMiddleware(next http.Handler) http.Handler {
 		// возврата из хендлера.
 		var bodyBytes []byte
 		if r.Body != nil {
-			bodyBytes, _ = io.ReadAll(r.Body)
+			var err error
+			bodyBytes, err = readLimitedBody(w, r)
+			if err != nil {
+				writeBodyError(w, err)
+				return
+			}
 			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 		}
 
@@ -562,6 +567,42 @@ func (cr *compressReader) Close() error {
 	return errGzip
 }
 
+// maxRequestBody — предельный размер тела входящего запроса. Формат батча
+// метрик детерминирован и занимает килобайты, поэтому 10 МиБ покрывают
+// нормальные запросы с большим запасом и не дают внешнему клиенту выделить
+// память под произвольно большой body.
+const maxRequestBody = 10 << 20
+
+// errBodyTooLarge возвращается readLimitedBody, когда тело запроса
+// превысило maxRequestBody.
+var errBodyTooLarge = errors.New("request body too large")
+
+// readLimitedBody читает тело запроса, ограничивая его maxRequestBody.
+// Лимит ставится до чтения, поэтому память под слишком большое тело
+// не выделяется. При превышении возвращается errBodyTooLarge.
+func readLimitedBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBody))
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			return nil, errBodyTooLarge
+		}
+		return nil, err
+	}
+	return body, nil
+}
+
+// writeBodyError отвечает на ошибку чтения тела запроса: 413 при превышении
+// лимита и 500 в остальных случаях.
+func writeBodyError(w http.ResponseWriter, err error) {
+	if errors.Is(err, errBodyTooLarge) {
+		log.Warn().Int("limit", maxRequestBody).Msg("request body exceeds limit")
+		http.Error(w, errBodyTooLarge.Error(), http.StatusRequestEntityTooLarge)
+		return
+	}
+	http.Error(w, "failed to read body", http.StatusInternalServerError)
+}
+
 // GzipMiddleware сжимает ответы (Content-Type: application/json или
 // text/html) и разжимает тело запроса, если пришёл Content-Encoding: gzip.
 // Писатели и читатели gzip берутся из sync.Pool, потому что создание
@@ -595,7 +636,10 @@ func (h *Handler) GzipMiddleware(next http.Handler) http.Handler {
 				return
 			}
 			defer cr.Close()
-			r.Body = cr
+			// Лимит применяется уже к распакованному потоку: сжатое тело
+			// может быть совсем небольшим («gzip-бомба»), поэтому
+			// ограничивать размер надо после декомпрессии.
+			r.Body = http.MaxBytesReader(w, cr, maxRequestBody)
 		}
 
 		finalWriter := &contentTypeCheckWriter{ResponseWriter: ow, rawWriter: w}
@@ -689,9 +733,9 @@ func (h *Handler) HashMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		body, err := io.ReadAll(r.Body)
+		body, err := readLimitedBody(w, r)
 		if err != nil {
-			http.Error(w, "failed to read body", http.StatusInternalServerError)
+			writeBodyError(w, err)
 			return
 		}
 		r.Body = io.NopCloser(bytes.NewReader(body))
@@ -734,9 +778,12 @@ func (h *Handler) DecryptMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		body, err := io.ReadAll(r.Body)
+		// Ограничиваем размер тела до чтения: без лимита внешний клиент
+		// может прислать конверт произвольного размера, и сервер выделит
+		// под него память целиком.
+		body, err := readLimitedBody(w, r)
 		if err != nil {
-			http.Error(w, "failed to read body", http.StatusInternalServerError)
+			writeBodyError(w, err)
 			return
 		}
 

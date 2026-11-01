@@ -123,6 +123,29 @@ func TestLoadConfigFrom_InvalidStoreInterval(t *testing.T) {
 	}
 }
 
+// TestLoadConfigFrom_FileStoreIntervalSubSecond проверяет, что субсекундный
+// store_interval из файла отклоняется: 0 у сервера означает синхронное
+// сохранение, поэтому "300ms" не должно молча округляться до нуля.
+func TestLoadConfigFrom_FileStoreIntervalSubSecond(t *testing.T) {
+	saved := saveEnv()
+	defer restoreEnv(saved)
+	clearEnv()
+
+	path := writeConfigFile(t, `{"store_interval": "300ms"}`)
+
+	oldArgs := os.Args
+	os.Args = []string{"server", "-c", path}
+	defer func() { os.Args = oldArgs }()
+
+	_, err := loadConfigFromArgs()
+	if err == nil {
+		t.Fatal("loadConfigFromArgs() = nil, want error for sub-second store_interval")
+	}
+	if !strings.Contains(err.Error(), "store_interval") {
+		t.Errorf("error = %q, want mention of store_interval", err)
+	}
+}
+
 func TestLoadConfigFrom_InvalidRestore(t *testing.T) {
 	saved := saveEnv()
 	defer restoreEnv(saved)
