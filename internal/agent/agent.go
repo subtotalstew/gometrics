@@ -183,6 +183,10 @@ type Agent struct {
 	// flushTimeout ограничивает ожидание свободного воркера при
 	// завершающем сбросе снимка; по умолчанию defaultFlushTimeout.
 	flushTimeout time.Duration
+
+	// shutdownTimeout ограничивает доработку батчей воркерами после
+	// сигнала; по умолчанию defaultShutdownTimeout.
+	shutdownTimeout time.Duration
 }
 
 // NewAgent создаёт агент, который опрашивает метрики каждые pollInterval
@@ -205,6 +209,7 @@ func NewAgent(serverAddr string, pollInterval, reportInterval, rateLimit int, ke
 		key:            key,
 		client:         &http.Client{Timeout: 5 * time.Second},
 		flushTimeout:   defaultFlushTimeout,
+		shutdownTimeout: defaultShutdownTimeout,
 	}
 }
 
@@ -231,7 +236,13 @@ func (a *Agent) SetCryptoKey(path string) error {
 // defaultFlushTimeout — сколько агент готов ждать свободного воркера, чтобы
 // поставить в очередь завершающий батч при остановке. Больше ждать нет
 // смысла: если воркеры заняты ретраями, сервер, скорее всего, недоступен.
-const defaultFlushTimeout = 10 * time.Second
+const defaultFlushTimeout = 5 * time.Second
+
+// defaultShutdownTimeout — сколько после сигнала агент даёт воркерам на
+// доработку батчей, которые уже в отправке. Ограничение нужно, чтобы
+// недоступный сервер не затягивал остановку: по истечении времени ретраи
+// прерываются, а незавершённый батч теряется.
+const defaultShutdownTimeout = 10 * time.Second
 
 // Run запускает агент и блокируется до получения SIGINT, SIGTERM или SIGQUIT.
 // Внутри поднимаются три горутины-поллера (runtime, gopsutil, отправка)
@@ -241,12 +252,14 @@ const defaultFlushTimeout = 10 * time.Second
 // По сигналу агент не теряет уже собранные данные, но время завершения
 // остаётся предсказуемым:
 //
-//   - поллеры останавливаются;
+//   - поллеры останавливаются, репортёр не ждёт занятых ретраями воркеров
+//     (снимок, не вставший в очередь, заменяется завершающим сбросом);
 //   - последний снимок досылается в очередь с ожиданием не дольше
-//     flushTimeout (если все воркеры заняты долгими ретраями, снимок
-//     пропускается с предупреждением — иначе Run висел бы навсегда);
-//   - батчи, уже принятые воркерами, дорабатываются до конца, включая
-//     повторы при временных ошибках: это данные, которые были в обработке.
+//     flushTimeout (если все воркеры заняты, снимок пропускается
+//     с предупреждением);
+//   - батчи, уже принятые воркерами, дорабатываются с ретраями, но сброс
+//     и доработка вместе укладываются в общий бюджет shutdownTimeout:
+//     иначе недоступный сервер держал бы агент живым всё время ретраев.
 func (a *Agent) Run() {
 	log.Info().
 		Int("poll_interval", a.pollInterval).
@@ -257,6 +270,11 @@ func (a *Agent) Run() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// sendCtx управляет отправкой батчей. При остановке он отменяется по
+	// таймауту, чтобы ретраи не затягивали завершение агента.
+	sendCtx, cancelSend := context.WithCancel(context.Background())
+	defer cancelSend()
+
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 
@@ -265,7 +283,7 @@ func (a *Agent) Run() {
 	var workersWG sync.WaitGroup
 	for i := 0; i < a.rateLimit; i++ {
 		workersWG.Add(1)
-		go a.worker(i, jobs, &workersWG)
+		go a.worker(sendCtx, i, jobs, &workersWG)
 	}
 
 	var pollersWG sync.WaitGroup
@@ -289,15 +307,37 @@ func (a *Agent) Run() {
 	cancel()
 	pollersWG.Wait()
 
-	// 2. Досылаем последний снимок: данные, собранные между двумя
-	//    отчётами, иначе потерялись бы вместе с процессом. Ожидание
-	//    свободного воркера ограничено flushTimeout — см. flushMetrics.
-	a.flushMetrics(jobs)
+	// Бюджет остановки общий: и завершающий сброс, и доработка батчей
+	// должны уложиться в shutdownTimeout, иначе недоступный сервер
+	// затягивал бы завершение агента.
+	deadline := time.Now().Add(a.shutdownTimeout)
 
-	// 3. Закрываем очередь: воркеры отправят всё уже поставленное
-	//    (с повторами при временных ошибках) и только потом завершатся.
+	// 2. Досылаем последний снимок: данные, собранные между двумя
+	//    отчётами, иначе потерялись бы вместе с процессом. Ждём воркера
+	//    не дольше flushTimeout и не дольше остатка бюджета.
+	flushWait := a.flushTimeout
+	if left := time.Until(deadline); left < flushWait {
+		flushWait = left
+	}
+	a.flushMetrics(jobs, flushWait)
+
+	// 3. Закрываем очередь: воркеры отправят всё уже поставленное.
 	close(jobs)
+
+	// 4. Ждём воркеров до конца бюджета: по его истечении отправка
+	//    прерывается, чтобы ретраи не держали агент живым.
+	left := time.Until(deadline)
+	if left < 0 {
+		left = 0
+	}
+	stopTimer := time.AfterFunc(left, func() {
+		log.Warn().
+			Dur("timeout", a.shutdownTimeout).
+			Msg("воркеры не успели доработать батчи, отправка прервана")
+		cancelSend()
+	})
 	workersWG.Wait()
+	stopTimer.Stop()
 
 	log.Info().Msg("agent stopped")
 }
@@ -359,17 +399,20 @@ func (a *Agent) runReporter(ctx context.Context, jobs chan<- []models.Metrics, w
 	for {
 		select {
 		case <-ticker.C:
-			a.enqueueMetrics(jobs)
+			a.enqueueMetrics(ctx, jobs)
 		case <-ctx.Done():
 			return
 		}
 	}
 }
 
-// enqueueMetrics ставит в очередь снимок текущих метрик. Отправка в jobs
-// не прерывается контекстом: воркеры живут до close(jobs), поэтому батч,
-// сформированный в момент получения сигнала, всегда будет доставлен.
-func (a *Agent) enqueueMetrics(jobs chan<- []models.Metrics) {
+// enqueueMetrics ставит в очередь снимок текущих метрик.
+//
+// Ожидание свободного воркера прерывается отменой контекста: при остановке
+// агент не должен зависеть от того, заняты ли воркеры долгими ретраями.
+// Непоставленный снимок при этом не теряется — он остаётся в коллекторе, и
+// его досылает flushMetrics уже со своим таймаутом.
+func (a *Agent) enqueueMetrics(ctx context.Context, jobs chan<- []models.Metrics) {
 	// Флаг «есть неотправленное» снимаем до сборки снимка: если поллер
 	// успеет обновить метрики между сборкой и отправкой, флаг поднимется
 	// снова, и при остановке эти данные всё равно будут досланы.
@@ -381,17 +424,23 @@ func (a *Agent) enqueueMetrics(jobs chan<- []models.Metrics) {
 		return
 	}
 
-	jobs <- metrics
+	select {
+	case jobs <- metrics:
+	case <-ctx.Done():
+		// Агент останавливается: не ждём воркеров, занятых ретраями.
+		// Снимок подберёт завершающий сброс в Run.
+		a.dirty.Store(true)
+		log.Debug().Msg("остановка: батч не поставлен в очередь, данные досошлёт завершающий сброс")
+	}
 }
 
 // flushMetrics досылает последний снимок метрик перед остановкой агента.
 //
 // Если после последнего поставленного в очередь снимка измерений не было
 // (dirty == false), отправлять нечего и flushMetrics не блокируется.
-// Ожидание свободного воркера ограничено flushTimeout: доставка данных
-// важнее скорости, но завершение не должно зависать навсегда, если все
-// воркеры заняты длинными ретраями.
-func (a *Agent) flushMetrics(jobs chan<- []models.Metrics) {
+// Ожидание свободного воркера ограничено wait: доставка данных важнее
+// скорости, но остановка не должна зависать, если все воркеры заняты.
+func (a *Agent) flushMetrics(jobs chan<- []models.Metrics, wait time.Duration) {
 	if !a.dirty.Load() {
 		log.Debug().Msg("нет неотправленных метрик, завершающий сброс не нужен")
 		return
@@ -402,13 +451,16 @@ func (a *Agent) flushMetrics(jobs chan<- []models.Metrics) {
 		return
 	}
 
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+
 	select {
 	case jobs <- metrics:
 		log.Info().Int("count", len(metrics)).Msg("завершающий батч поставлен в очередь")
-	case <-time.After(a.flushTimeout):
+	case <-timer.C:
 		log.Warn().
 			Int("count", len(metrics)).
-			Dur("timeout", a.flushTimeout).
+			Dur("timeout", wait).
 			Msg("не удалось поставить завершающий батч в очередь: воркеры заняты, снимок пропущен")
 	}
 }
@@ -441,49 +493,33 @@ func (a *Agent) buildBatch() []models.Metrics {
 	return metrics
 }
 
-func (a *Agent) worker(id int, jobs <-chan []models.Metrics, wg *sync.WaitGroup) {
+func (a *Agent) worker(ctx context.Context, id int, jobs <-chan []models.Metrics, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for metrics := range jobs {
 		log.Debug().Int("worker_id", id).Int("count", len(metrics)).Msg("worker sending batch")
-		a.sendMetricsBatch(metrics)
+		a.sendMetricsBatch(ctx, metrics)
 	}
 }
 
-func (a *Agent) sendMetricsBatch(metrics []models.Metrics) {
+func (a *Agent) sendMetricsBatch(ctx context.Context, metrics []models.Metrics) {
 	body, err := json.Marshal(metrics)
 	if err != nil {
 		log.Error().Err(err).Int("count", len(metrics)).Msg("failed to marshal metrics batch")
 		return
 	}
 
-	var compressed bytes.Buffer
-	if err := compressGzip(&compressed, body); err != nil {
-		log.Error().Err(err).Msg("failed to gzip body")
-		return
-	}
-
-	payload, err := a.encryptPayload(compressed.Bytes())
+	payload, headers, err := a.preparePayload(body)
 	if err != nil {
-		log.Error().Err(err).Int("count", len(metrics)).Msg("failed to encrypt metrics batch")
+		log.Error().Err(err).Int("count", len(metrics)).Msg("failed to prepare metrics batch")
 		return
 	}
 
 	url := fmt.Sprintf("%s/updates/", a.serverAddr)
 
 	sendOnce := func() error {
-		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(payload))
+		req, err := a.newRequest(ctx, url, payload, headers)
 		if err != nil {
 			return err
-		}
-
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Content-Encoding", "gzip")
-		req.Header.Set("Accept-Encoding", "gzip")
-
-		// Подпись считается по тому, что реально уходит в сеть: при
-		// включённом шифровании — по шифртексту.
-		if a.key != "" {
-			req.Header.Set("HashSHA256", hash.Compute(payload, a.key))
 		}
 
 		resp, err := a.client.Do(req)
@@ -492,14 +528,10 @@ func (a *Agent) sendMetricsBatch(metrics []models.Metrics) {
 		}
 		defer resp.Body.Close()
 
-		if err := checkResponse(resp); err != nil {
-			return err
-		}
-
-		return nil
+		return checkResponse(resp)
 	}
 
-	err = retry.Do("send_metrics_batch", sendOnce, isRetriableHTTPError)
+	err = retry.DoContext(ctx, "send_metrics_batch", sendOnce, isRetriableHTTPError)
 
 	if err != nil {
 		log.Error().Err(err).Int("count", len(metrics)).Msg("failed to send metrics batch after retries")
@@ -507,6 +539,57 @@ func (a *Agent) sendMetricsBatch(metrics []models.Metrics) {
 	}
 
 	log.Info().Int("count", len(metrics)).Msg("metrics batch sent successfully")
+}
+
+// preparePayload готовит тело запроса к отправке: сжимает его gzip и, если
+// асимметричное шифрование включено, упаковывает в конверт.
+//
+// Возвращаемые заголовки описывают именно то, что уходит в сеть. Без
+// шифрования в сеть идёт gzip, поэтому Content-Encoding: gzip корректен.
+// С шифрованием в сеть идёт конверт: Content-Encoding для него не ставится
+// (посредник не должен пытаться распаковать шифртекст), а кодировка
+// открытого текста сообщается отдельным заголовком, который сервер
+// применяет уже после расшифрования.
+func (a *Agent) preparePayload(body []byte) ([]byte, http.Header, error) {
+	var compressed bytes.Buffer
+	if err := compressGzip(&compressed, body); err != nil {
+		return nil, nil, fmt.Errorf("agent: не удалось сжать тело запроса: %w", err)
+	}
+
+	payload, err := a.encryptPayload(compressed.Bytes())
+	if err != nil {
+		return nil, nil, err
+	}
+
+	headers := make(http.Header)
+	headers.Set("Content-Type", "application/json")
+	headers.Set("Accept-Encoding", "gzip")
+
+	if a.pubKey == nil {
+		headers.Set("Content-Encoding", "gzip")
+	} else {
+		headers.Set(crypto.HeaderPayloadEncoding, "gzip")
+	}
+
+	return payload, headers, nil
+}
+
+// newRequest собирает POST-запрос с готовым телом и заголовками.
+// Контекст позволяет прервать попытку отправки при остановке агента.
+// Подпись считается по тому, что реально уходит в сеть: при включённом
+// шифровании — по шифртексту.
+func (a *Agent) newRequest(ctx context.Context, url string, payload []byte, headers http.Header) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header = headers.Clone()
+	if a.key != "" {
+		req.Header.Set("HashSHA256", hash.Compute(payload, a.key))
+	}
+
+	return req, nil
 }
 
 // checkResponse превращает неуспешный ответ сервера в ошибку отправки.
@@ -549,36 +632,22 @@ func (a *Agent) sendMetricJSON(client *http.Client, metric models.Metrics) {
 		return
 	}
 
-	var buf bytes.Buffer
-	if err := compressGzip(&buf, body); err != nil {
-		log.Error().Err(err).Msg("failed to gzip body")
-		return
-	}
-
-	payload, err := a.encryptPayload(buf.Bytes())
+	payload, headers, err := a.preparePayload(body)
 	if err != nil {
 		log.Error().
 			Err(err).
 			Str("metric", metric.ID).
-			Msg("failed to encrypt metric")
+			Msg("failed to prepare metric")
 		return
 	}
 
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(payload))
+	req, err := a.newRequest(context.Background(), url, payload, headers)
 	if err != nil {
 		log.Error().
 			Err(err).
 			Str("metric", metric.ID).
 			Msg("failed to create request")
 		return
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Content-Encoding", "gzip")
-	req.Header.Set("Accept-Encoding", "gzip")
-
-	if a.key != "" {
-		req.Header.Set("HashSHA256", hash.Compute(payload, a.key))
 	}
 
 	resp, err := client.Do(req)

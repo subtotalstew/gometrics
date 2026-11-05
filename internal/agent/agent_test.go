@@ -3,6 +3,7 @@ package agent
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -59,7 +60,7 @@ func TestSendMetricsBatch_Success(t *testing.T) {
 	batch := []models.Metrics{
 		{ID: "g1", MType: models.Gauge, Value: &v},
 	}
-	a.sendMetricsBatch(batch)
+	a.sendMetricsBatch(context.Background(), batch)
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -88,7 +89,7 @@ func TestSendMetricsBatch_ServerError(t *testing.T) {
 
 	a := NewAgent(srv.URL, 1, 1, 1, "")
 	v := 1.0
-	a.sendMetricsBatch([]models.Metrics{{ID: "g", MType: models.Gauge, Value: &v}})
+	a.sendMetricsBatch(context.Background(), []models.Metrics{{ID: "g", MType: models.Gauge, Value: &v}})
 }
 
 // TestCheckResponse проверяет, что неуспешные ответы сервера становятся
@@ -129,7 +130,7 @@ func TestEnqueueMetrics(t *testing.T) {
 	a.dirty.Store(true)
 
 	jobs := make(chan []models.Metrics, 1)
-	a.enqueueMetrics(jobs)
+	a.enqueueMetrics(context.Background(), jobs)
 
 	select {
 	case batch := <-jobs:
@@ -145,9 +146,8 @@ func TestEnqueueMetrics(t *testing.T) {
 	}
 }
 
-// TestEnqueueMetrics_NotDropped проверяет, что батч не теряется при
-// остановке агента: отправка в очередь не прерывается контекстом, а ждёт
-// воркера, который его заберёт.
+// TestEnqueueMetrics_NotDropped проверяет, что при жизни агента батч не
+// теряется: отправка в очередь ждёт воркера, который его заберёт.
 func TestEnqueueMetrics_NotDropped(t *testing.T) {
 	a := NewAgent("http://127.0.0.1:1", 1, 1, 1, "")
 	a.collector.UpdateMetrics()
@@ -157,7 +157,7 @@ func TestEnqueueMetrics_NotDropped(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		a.enqueueMetrics(jobs)
+		a.enqueueMetrics(context.Background(), jobs)
 	}()
 
 	select {
@@ -182,6 +182,34 @@ func TestEnqueueMetrics_NotDropped(t *testing.T) {
 	}
 }
 
+// TestEnqueueMetrics_Cancelled проверяет, что остановка не ждёт занятых
+// воркеров: enqueueMetrics возвращается по отмене контекста, а снимок
+// остаётся помеченным как неотправленный.
+func TestEnqueueMetrics_Cancelled(t *testing.T) {
+	a := NewAgent("http://127.0.0.1:1", 1, 1, 1, "")
+	a.collector.UpdateMetrics()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	jobs := make(chan []models.Metrics) // никто не читает
+	cancel()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		a.enqueueMetrics(ctx, jobs)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("enqueueMetrics blocked on cancelled context")
+	}
+
+	if !a.dirty.Load() {
+		t.Error("dirty = false, want true: непоставленный снимок должен остаться неотправленным")
+	}
+}
+
 // TestFlushMetrics_SendsLastSnapshot проверяет, что при остановке агент
 // досылает снимок, который ещё не уходил на сервер.
 func TestFlushMetrics_SendsLastSnapshot(t *testing.T) {
@@ -190,7 +218,7 @@ func TestFlushMetrics_SendsLastSnapshot(t *testing.T) {
 	a.dirty.Store(true)
 
 	jobs := make(chan []models.Metrics, 1)
-	a.flushMetrics(jobs)
+	a.flushMetrics(jobs, time.Second)
 
 	select {
 	case batch := <-jobs:
@@ -210,7 +238,7 @@ func TestFlushMetrics_SkipsAlreadySentSnapshot(t *testing.T) {
 	a.dirty.Store(false) // после последнего снимка измерений не было
 
 	jobs := make(chan []models.Metrics, 1)
-	a.flushMetrics(jobs)
+	a.flushMetrics(jobs, time.Second)
 
 	select {
 	case <-jobs:
@@ -232,7 +260,7 @@ func TestFlushMetrics_Timeout(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		a.flushMetrics(jobs)
+		a.flushMetrics(jobs, a.flushTimeout)
 	}()
 
 	select {
@@ -260,7 +288,7 @@ func TestWorker_SendsBatch(t *testing.T) {
 	jobs := make(chan []models.Metrics, 1)
 	var wg sync.WaitGroup
 	wg.Add(1)
-	go a.worker(0, jobs, &wg)
+	go a.worker(context.Background(), 0, jobs, &wg)
 
 	v := 1.0
 	jobs <- []models.Metrics{{ID: "g", MType: models.Gauge, Value: &v}}
@@ -360,6 +388,49 @@ func TestAgent_Run_GracefulShutdown(t *testing.T) {
 	}
 }
 
+// TestAgent_Run_StopsWithInFlightRequest проверяет, что остановка не ждёт
+// зависших воркеров: если сервер не отвечает, незавершённая отправка
+// прерывается по shutdownTimeout, а Run завершается предсказуемо быстро.
+func TestAgent_Run_StopsWithInFlightRequest(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("os.Interrupt is not supported on Windows")
+	}
+
+	block := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-block // держим запрос, пока тест не закончится
+	}))
+	defer srv.Close()
+	defer close(block)
+
+	a := NewAgent(srv.URL, 1, 1, 1, "")
+	a.shutdownTimeout = 100 * time.Millisecond
+	a.flushTimeout = 50 * time.Millisecond
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		a.Run()
+	}()
+
+	// Даём отчёту уйти и застрять внутри запроса.
+	time.Sleep(1500 * time.Millisecond)
+
+	p, err := os.FindProcess(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Signal(os.Interrupt); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run не завершился: остановка ждёт зависший запрос/ретраи")
+	}
+}
+
 func TestCollector_Reset(t *testing.T) {
 	t.Parallel()
 
@@ -419,15 +490,16 @@ func TestSetCryptoKey(t *testing.T) {
 
 // TestSendMetricsBatch_Encrypted проверяет, что при заданном ключе тело
 // запроса уходит зашифрованным, подпись считается по шифртексту, а сервер
-// восстанавливает исходный батч приватным ключом.
+// восстанавливает исходный батч приватным ключом. Заголовки при этом должны
+// описывать именно конверт, а не gzip: Content-Encoding на шифртексте
+// не выставляется, кодировка открытого текста — в отдельном заголовке.
 func TestSendMetricsBatch_Encrypted(t *testing.T) {
 	priv := generateTestKey(t)
 
 	var (
-		mu       sync.Mutex
-		raw      []byte
-		head     http.Header
-		encoding string
+		mu   sync.Mutex
+		raw  []byte
+		head http.Header
 	)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() { _ = r.Body.Close() }()
@@ -435,7 +507,6 @@ func TestSendMetricsBatch_Encrypted(t *testing.T) {
 		mu.Lock()
 		raw = body
 		head = r.Header.Clone()
-		encoding = r.Header.Get("Content-Encoding")
 		mu.Unlock()
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -448,7 +519,7 @@ func TestSendMetricsBatch_Encrypted(t *testing.T) {
 
 	value := 1.5
 	batch := []models.Metrics{{ID: "g1", MType: models.Gauge, Value: &value}}
-	a.sendMetricsBatch(batch)
+	a.sendMetricsBatch(context.Background(), batch)
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -456,8 +527,14 @@ func TestSendMetricsBatch_Encrypted(t *testing.T) {
 	if len(raw) == 0 {
 		t.Fatal("сервер не получил тело запроса")
 	}
-	if encoding != "gzip" {
-		t.Errorf("Content-Encoding = %q, want gzip", encoding)
+	if got := head.Get("Content-Encoding"); got != "" {
+		t.Errorf("Content-Encoding = %q, want empty: на шифртексте его быть не должно", got)
+	}
+	if got := head.Get(crypto.HeaderPayloadEncoding); got != "gzip" {
+		t.Errorf("%s = %q, want gzip", crypto.HeaderPayloadEncoding, got)
+	}
+	if got := head.Get("Content-Type"); got != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", got)
 	}
 	// В том, что ушло по сети, не должно быть открытого JSON.
 	if bytes.Contains(raw, []byte(`"id"`)) || bytes.Contains(raw, []byte("g1")) {
@@ -523,3 +600,4 @@ func writePublicKeyFile(t *testing.T, pub *rsa.PublicKey) string {
 	}
 	return path
 }
+

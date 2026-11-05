@@ -3,6 +3,8 @@
 package retry
 
 import (
+	"context"
+	"fmt"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -24,10 +26,27 @@ type IsRetriable func(err error) bool
 //
 // Возвращается ошибка последней попытки. Паузы между попытками и итоговая
 // ошибка логируются, operation используется как имя операции в логах.
+//
+// Do — это DoContext с фоновым контекстом: прервать повторы нельзя.
 func Do(operation string, fn func() error, isRetriable IsRetriable) error {
+	return DoContext(context.Background(), operation, fn, isRetriable)
+}
+
+// DoContext — как Do, но прекращает попытки при отмене ctx. Нужна там, где
+// время выполнения ограничено: например, при остановке приложения, когда
+// ретраи не должны затягивать завершение.
+//
+// Отмена проверяется перед каждой попыткой и во время паузы между ними,
+// поэтому уже начатый сетевой вызов прерывается только своим контекстом
+// (если fn его использует).
+func DoContext(ctx context.Context, operation string, fn func() error, isRetriable IsRetriable) error {
 	var err error
 
 	for attempt := 0; ; attempt++ {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("%s: попытки прекращены: %w", operation, ctxErr)
+		}
+
 		err = fn()
 		if err == nil {
 			return nil
@@ -54,6 +73,15 @@ func Do(operation string, fn func() error, isRetriable IsRetriable) error {
 			Dur("retry_in", wait).
 			Msg("retriable error, will retry")
 
-		time.Sleep(wait)
+		select {
+		case <-time.After(wait):
+		case <-ctx.Done():
+			log.Warn().
+				Err(ctx.Err()).
+				Str("operation", operation).
+				Int("attempt", attempt+1).
+				Msg("retries stopped by context")
+			return fmt.Errorf("%s: попытки прекращены: %w", operation, ctx.Err())
+		}
 	}
 }

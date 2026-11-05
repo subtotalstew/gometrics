@@ -771,6 +771,11 @@ func (h *Handler) HashMiddleware(next http.Handler) http.Handler {
 // Если ключ не задан, middleware ничего не делает и запросы проходят как
 // раньше. Если ключ задан, запрос с непустым телом обязан быть зашифрованным
 // конвертом, иначе — 400.
+//
+// Кодировка открытого текста берётся из crypto.HeaderPayloadEncoding (агент
+// кладёт туда "gzip") и выставляется стандартным Content-Encoding уже после
+// расшифрования: на шифртексте Content-Encoding не бывает, иначе посредники
+// пытались бы распаковать конверт.
 func (h *Handler) DecryptMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if h.cryptoKey == nil || r.Body == nil || r.Body == http.NoBody {
@@ -811,6 +816,15 @@ func (h *Handler) DecryptMiddleware(next http.Handler) http.Handler {
 			}
 			http.Error(w, "failed to decrypt body", http.StatusBadRequest)
 			return
+		}
+
+		// Тело расшифровано. На шифртексте Content-Encoding не выставлялся,
+		// поэтому сейчас его нет; кодировку открытого текста агент сообщает
+		// отдельным заголовком. Применяем её для следующих middleware
+		// (GzipMiddleware разожмёт тело), а служебный заголовок убираем.
+		if enc := r.Header.Get(crypto.HeaderPayloadEncoding); enc != "" {
+			r.Header.Set("Content-Encoding", enc)
+			r.Header.Del(crypto.HeaderPayloadEncoding)
 		}
 
 		r.Body = io.NopCloser(bytes.NewReader(decrypted))

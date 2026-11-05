@@ -782,7 +782,9 @@ func TestDecryptMiddleware_FullChain(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/updates/", bytes.NewReader(envelope))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Content-Encoding", "gzip")
+	// По сети идёт конверт, а не gzip: Content-Encoding на шифртексте не
+	// ставится, кодировка открытого текста — в отдельном заголовке.
+	req.Header.Set(crypto.HeaderPayloadEncoding, "gzip")
 	req.Header.Set("HashSHA256", hash.Compute(envelope, "sign-key"))
 
 	w := httptest.NewRecorder()
