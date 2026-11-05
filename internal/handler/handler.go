@@ -1,5 +1,6 @@
 // Package handler содержит HTTP-хендлеры сервиса метрик, middleware
-// (gzip, логирование, подпись HMAC-SHA256) и маршрутизацию этих хендлеров.
+// (gzip, логирование, подпись HMAC-SHA256, расшифрование тела запроса
+// асимметричным ключом) и маршрутизацию этих хендлеров.
 //
 // Эндпоинты сервиса:
 //
@@ -17,8 +18,10 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/hmac"
+	"crypto/rsa"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -32,27 +35,48 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/subtotalstew/gometrics.git/internal/audit"
+	"github.com/subtotalstew/gometrics.git/internal/crypto"
 	"github.com/subtotalstew/gometrics.git/internal/hash"
 	"github.com/subtotalstew/gometrics.git/internal/models"
 	"github.com/subtotalstew/gometrics.git/internal/storage"
 )
 
 // Handler обслуживает HTTP-запросы сервиса метрик. Он хранит ссылку на
-// хранилище, необязательные зависимости (колбэк синхронного сохранения,
-// соединение с БД, ключ подписи, издатель аудита) и не содержит
-// изменяемого состояния после настройки.
+// хранилище и необязательные зависимости (колбэк синхронного сохранения,
+// соединение с БД, ключ подписи, ключ расшифрования, издатель аудита)
+// и не содержит изменяемого состояния после настройки.
 type Handler struct {
-	storage  storage.Storage
-	syncSave func()
-	db       *sql.DB
-	key      string
-	audit    *audit.Subject
+	storage   storage.Storage
+	syncSave  func()
+	db        *sql.DB
+	key       string
+	cryptoKey *rsa.PrivateKey
+	audit     *audit.Subject
 }
 
 // SetKey задаёт ключ подписи HMAC-SHA256. Пока ключ не задан,
 // HashMiddleware пропускает запросы без проверки подписи.
 func (h *Handler) SetKey(key string) {
 	h.key = key
+}
+
+// SetCryptoKey включает расшифрование тел запросов: приватный ключ читается
+// из файла по пути path. Пустой path оставляет расшифрование выключенным.
+//
+// Ключ читается один раз при настройке, поэтому опечатка в пути даёт ошибку
+// при старте сервера, а не на первом запросе агента.
+func (h *Handler) SetCryptoKey(path string) error {
+	if path == "" {
+		h.cryptoKey = nil
+		return nil
+	}
+
+	privateKey, err := crypto.LoadPrivateKey(path)
+	if err != nil {
+		return fmt.Errorf("handler: %w", err)
+	}
+	h.cryptoKey = privateKey
+	return nil
 }
 
 // NewHandler создаёт хендлер поверх указанного хранилища метрик.
@@ -343,7 +367,12 @@ func (h *Handler) LoggingMiddleware(next http.Handler) http.Handler {
 		// возврата из хендлера.
 		var bodyBytes []byte
 		if r.Body != nil {
-			bodyBytes, _ = io.ReadAll(r.Body)
+			var err error
+			bodyBytes, err = readLimitedBody(w, r)
+			if err != nil {
+				writeBodyError(w, err)
+				return
+			}
 			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 		}
 
@@ -538,6 +567,42 @@ func (cr *compressReader) Close() error {
 	return errGzip
 }
 
+// maxRequestBody — предельный размер тела входящего запроса. Формат батча
+// метрик детерминирован и занимает килобайты, поэтому 10 МиБ покрывают
+// нормальные запросы с большим запасом и не дают внешнему клиенту выделить
+// память под произвольно большой body.
+const maxRequestBody = 10 << 20
+
+// errBodyTooLarge возвращается readLimitedBody, когда тело запроса
+// превысило maxRequestBody.
+var errBodyTooLarge = errors.New("request body too large")
+
+// readLimitedBody читает тело запроса, ограничивая его maxRequestBody.
+// Лимит ставится до чтения, поэтому память под слишком большое тело
+// не выделяется. При превышении возвращается errBodyTooLarge.
+func readLimitedBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBody))
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			return nil, errBodyTooLarge
+		}
+		return nil, err
+	}
+	return body, nil
+}
+
+// writeBodyError отвечает на ошибку чтения тела запроса: 413 при превышении
+// лимита и 500 в остальных случаях.
+func writeBodyError(w http.ResponseWriter, err error) {
+	if errors.Is(err, errBodyTooLarge) {
+		log.Warn().Int("limit", maxRequestBody).Msg("request body exceeds limit")
+		http.Error(w, errBodyTooLarge.Error(), http.StatusRequestEntityTooLarge)
+		return
+	}
+	http.Error(w, "failed to read body", http.StatusInternalServerError)
+}
+
 // GzipMiddleware сжимает ответы (Content-Type: application/json или
 // text/html) и разжимает тело запроса, если пришёл Content-Encoding: gzip.
 // Писатели и читатели gzip берутся из sync.Pool, потому что создание
@@ -571,7 +636,10 @@ func (h *Handler) GzipMiddleware(next http.Handler) http.Handler {
 				return
 			}
 			defer cr.Close()
-			r.Body = cr
+			// Лимит применяется уже к распакованному потоку: сжатое тело
+			// может быть совсем небольшим («gzip-бомба»), поэтому
+			// ограничивать размер надо после декомпрессии.
+			r.Body = http.MaxBytesReader(w, cr, maxRequestBody)
 		}
 
 		finalWriter := &contentTypeCheckWriter{ResponseWriter: ow, rawWriter: w}
@@ -665,9 +733,9 @@ func (h *Handler) HashMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		body, err := io.ReadAll(r.Body)
+		body, err := readLimitedBody(w, r)
 		if err != nil {
-			http.Error(w, "failed to read body", http.StatusInternalServerError)
+			writeBodyError(w, err)
 			return
 		}
 		r.Body = io.NopCloser(bytes.NewReader(body))
@@ -689,6 +757,79 @@ func (h *Handler) HashMiddleware(next http.Handler) http.Handler {
 		next.ServeHTTP(hrw, r)
 
 		hrw.finalize()
+	})
+}
+
+// DecryptMiddleware расшифровывает тело запроса ключом, заданным в
+// SetCryptoKey. Агент шифрует тело публичным ключом, сервер расшифровывает
+// его приватным.
+//
+// Middleware включается первым в цепочке после проверки подписи и до
+// GzipMiddleware: подпись считается по тому, что пришло по сети (по
+// шифртексту), а распаковка gzip — уже по расшифрованному телу.
+//
+// Если ключ не задан, middleware ничего не делает и запросы проходят как
+// раньше. Если ключ задан, запрос с непустым телом обязан быть зашифрованным
+// конвертом, иначе — 400.
+//
+// Кодировка открытого текста берётся из crypto.HeaderPayloadEncoding (агент
+// кладёт туда "gzip") и выставляется стандартным Content-Encoding уже после
+// расшифрования: на шифртексте Content-Encoding не бывает, иначе посредники
+// пытались бы распаковать конверт.
+func (h *Handler) DecryptMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if h.cryptoKey == nil || r.Body == nil || r.Body == http.NoBody {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// Ограничиваем размер тела до чтения: без лимита внешний клиент
+		// может прислать конверт произвольного размера, и сервер выделит
+		// под него память целиком.
+		body, err := readLimitedBody(w, r)
+		if err != nil {
+			writeBodyError(w, err)
+			return
+		}
+
+		// Запросы без тела (GET /, /ping, POST /update/{type}/{name}/{value})
+		// шифровать нечего — пропускаем их без изменений.
+		if len(body) == 0 {
+			r.Body = http.NoBody
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		decrypted, err := crypto.Decrypt(h.cryptoKey, body)
+		if err != nil {
+			if errors.Is(err, crypto.ErrNotEnvelope) {
+				log.Warn().
+					Str("path", r.URL.Path).
+					Str("remote_addr", r.RemoteAddr).
+					Msg("request body is not encrypted")
+			} else {
+				log.Error().
+					Err(err).
+					Str("path", r.URL.Path).
+					Str("remote_addr", r.RemoteAddr).
+					Msg("failed to decrypt request body")
+			}
+			http.Error(w, "failed to decrypt body", http.StatusBadRequest)
+			return
+		}
+
+		// Тело расшифровано. На шифртексте Content-Encoding не выставлялся,
+		// поэтому сейчас его нет; кодировку открытого текста агент сообщает
+		// отдельным заголовком. Применяем её для следующих middleware
+		// (GzipMiddleware разожмёт тело), а служебный заголовок убираем.
+		if enc := r.Header.Get(crypto.HeaderPayloadEncoding); enc != "" {
+			r.Header.Set("Content-Encoding", enc)
+			r.Header.Del(crypto.HeaderPayloadEncoding)
+		}
+
+		r.Body = io.NopCloser(bytes.NewReader(decrypted))
+		r.ContentLength = int64(len(decrypted))
+		next.ServeHTTP(w, r)
 	})
 }
 

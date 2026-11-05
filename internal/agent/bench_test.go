@@ -87,7 +87,7 @@ func BenchmarkAgentSendMetricsBatch(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		a.sendMetricsBatch(batch)
+		a.sendMetricsBatch(context.Background(), batch)
 	}
 }
 
@@ -103,7 +103,7 @@ func BenchmarkAgentSendMetricsBatch_1000(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		a.sendMetricsBatch(batch)
+		a.sendMetricsBatch(context.Background(), batch)
 	}
 }
 
@@ -121,3 +121,4 @@ func benchBatchMetrics(n int) []models.Metrics {
 	}
 	return metrics
 }
+
