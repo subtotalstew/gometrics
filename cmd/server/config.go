@@ -20,6 +20,8 @@ type fileConfig struct {
 	AuditFile     *string `json:"audit_file"`
 	AuditURL      *string `json:"audit_url"`
 	PprofAddr     *string `json:"pprof_addr"`
+	TrustedSubnet *string `json:"trusted_subnet"`
+	GRPCAddress   *string `json:"grpc_address"`
 }
 
 // applyFileConfig накладывает значения из файла на cfg.
@@ -44,6 +46,13 @@ func applyFileConfig(cfg *config, path string, set func(name string) bool) error
 	fileconfig.ApplyIf(&cfg.auditFile, fc.AuditFile, set, "audit-file")
 	fileconfig.ApplyIf(&cfg.auditURL, fc.AuditURL, set, "audit-url")
 	fileconfig.ApplyIf(&cfg.pprofAddr, fc.PprofAddr, set, "pprof-addr")
+	fileconfig.ApplyIf(&cfg.trustedSubnet, fc.TrustedSubnet, set, "t")
+
+	// У флага два имени (-g и -grpc-address): файл не должен перекрывать
+	// значение, если задано любое из них.
+	if !set("g") && !set("grpc-address") && fc.GRPCAddress != nil {
+		cfg.grpcAddr = *fc.GRPCAddress
+	}
 
 	// store_interval: 0 — особое значение (синхронное сохранение),
 	// поэтому разбирается отдельным парсером, который не пропускает
