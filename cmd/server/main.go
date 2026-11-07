@@ -54,6 +54,7 @@ type config struct {
 	auditFile     string
 	auditURL      string
 	pprofAddr     string
+	trustedSubnet string
 }
 
 func main() {
@@ -110,6 +111,7 @@ func loadConfigFrom(fs *flag.FlagSet) (config, error) {
 	fs.StringVar(&cfg.auditFile, "audit-file", "", "path to audit log file")
 	fs.StringVar(&cfg.auditURL, "audit-url", "", "URL for audit log delivery")
 	fs.StringVar(&cfg.pprofAddr, "pprof-addr", "", "address of the pprof/debug HTTP server (empty = disabled)")
+	fs.StringVar(&cfg.trustedSubnet, "t", "", "trusted subnet in CIDR notation; metrics from other IPs are rejected with 403 (empty = no restriction)")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		return config{}, err
@@ -163,6 +165,9 @@ func loadConfigFrom(fs *flag.FlagSet) (config, error) {
 	if v := os.Getenv("PPROF_ADDR"); v != "" {
 		cfg.pprofAddr = v
 	}
+	if v := os.Getenv("TRUSTED_SUBNET"); v != "" {
+		cfg.trustedSubnet = v
+	}
 	return cfg, nil
 }
 
@@ -173,6 +178,10 @@ func loadConfigFrom(fs *flag.FlagSet) (config, error) {
 // (по шифртексту), затем тело расшифровывается приватным ключом, и только
 // после этого распаковывается gzip. Ключ расшифрования задаётся в serve через
 // handler.SetCryptoKey; без ключа DecryptMiddleware ничего не делает.
+//
+// Запись метрик дополнительно защищена проверкой X-Real-IP: если сервер
+// запущен с trusted_subnet, запросы на /update*, /updates* из чужих адресов
+// получают 403. Чтение метрик (/, /value, /ping) не ограничивается.
 func buildRouter(h *handler.Handler, key string) *chi.Mux {
 	r := chi.NewRouter()
 
@@ -185,18 +194,26 @@ func buildRouter(h *handler.Handler, key string) *chi.Mux {
 	r.Use(h.LoggingMiddleware)
 	r.Use(middleware.Recoverer)
 
-	r.Post("/update", h.UpdateJSONHandler)
+	// Запись метрик — в отдельной группе, потому что только эти маршруты
+	// проверяют доверенную подсеть.
+	r.Group(func(r chi.Router) {
+		r.Use(h.TrustedSubnetMiddleware)
+
+		r.Post("/update", h.UpdateJSONHandler)
+		r.Post("/update/", h.UpdateJSONHandler)
+
+		r.Post("/update/{type}/{name}/{value}", h.UpdateHandler)
+
+		r.Post("/updates", h.UpdatesJSONHandler)
+		r.Post("/updates/", h.UpdatesJSONHandler)
+	})
+
 	r.Post("/value", h.ValueJSONHandler)
-	r.Post("/update/", h.UpdateJSONHandler)
 	r.Post("/value/", h.ValueJSONHandler)
 
-	r.Post("/update/{type}/{name}/{value}", h.UpdateHandler)
 	r.Get("/value/{type}/{name}", h.ValueHandler)
 	r.Get("/", h.RootHandler)
 	r.Get("/ping", h.PingHandler)
-
-	r.Post("/updates", h.UpdatesJSONHandler)
-	r.Post("/updates/", h.UpdatesJSONHandler)
 
 	return r
 }
@@ -249,6 +266,15 @@ func serve(cfg config) error {
 	}
 
 	h := handler.NewHandler(metricsStorage)
+
+	// Доверенная подсеть разбирается на старте: битый CIDR в конфигурации
+	// должен останавливать сервер, а не отключать проверку незаметно.
+	if err := h.SetTrustedSubnet(cfg.trustedSubnet); err != nil {
+		return err
+	}
+	if cfg.trustedSubnet != "" {
+		log.Info().Str("subnet", cfg.trustedSubnet).Msg("проверка X-Real-IP: включена")
+	}
 
 	// Приватный ключ читается на старте: опечатка в пути или битый файл
 	// должны останавливать сервер сразу, а не ломать каждый батч агента.

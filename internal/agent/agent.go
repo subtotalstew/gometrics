@@ -1,6 +1,8 @@
 // Package agent собирает метрики рантайма и системы (gopsutil) и отправляет
 // их на сервер метрик батчами через POST /updates/ (gzip + подпись HMAC,
-// опционально асимметричное шифрование тела запроса).
+// опционально асимметричное шифрование тела запроса). В каждом запросе
+// отправляется заголовок X-Real-IP с адресом хоста агента — по нему сервер
+// проверяет, что агент входит в доверенную подсеть (trusted_subnet).
 package agent
 
 import (
@@ -12,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -50,6 +53,59 @@ func compressGzip(dst *bytes.Buffer, data []byte) error {
 		return err
 	}
 	return gz.Close()
+}
+
+// HeaderRealIP — заголовок, в котором агент сообщает серверу свой IP-адрес.
+// Сервер сверяет его с доверенной подсетью (trusted_subnet).
+const HeaderRealIP = "X-Real-IP"
+
+// HostIP возвращает IPv4-адрес хоста агента для заголовка X-Real-IP.
+//
+// Сначала берётся адрес, с которого ОС реально отправляет пакеты наружу
+// (UDP-соединение не шлёт данных, поэтому вызов дешёвый и не требует
+// доступности адреса). Если маршрута нет — первый не-loopback IPv4 из
+// поднятых интерфейсов. Если внешних адресов нет вовсе, возвращается
+// 127.0.0.1: сервер с подсетью 127.0.0.0/8 пустит такой запрос.
+func HostIP() string {
+	if conn, err := net.Dial("udp4", "8.8.8.8:80"); err == nil {
+		addr := conn.LocalAddr()
+		_ = conn.Close()
+		if udp, ok := addr.(*net.UDPAddr); ok && udp.IP != nil {
+			if ip4 := udp.IP.To4(); ip4 != nil {
+				return ip4.String()
+			}
+		}
+	}
+
+	ifaces, err := net.Interfaces()
+	if err == nil {
+		for _, iface := range ifaces {
+			if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+				continue
+			}
+			addrs, err := iface.Addrs()
+			if err != nil {
+				continue
+			}
+			for _, a := range addrs {
+				var ip net.IP
+				switch v := a.(type) {
+				case *net.IPNet:
+					ip = v.IP
+				case *net.IPAddr:
+					ip = v.IP
+				}
+				if ip == nil || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+					continue
+				}
+				if ip4 := ip.To4(); ip4 != nil {
+					return ip4.String()
+				}
+			}
+		}
+	}
+
+	return "127.0.0.1"
 }
 
 // Collector накапливает метрики в памяти: gauge — текущие значения
@@ -173,6 +229,7 @@ type Agent struct {
 	rateLimit      int
 	key            string
 	pubKey         *rsa.PublicKey
+	hostIP         string
 	client         *http.Client
 
 	// dirty — были ли измерения после последнего снимка, поставленного
@@ -195,20 +252,24 @@ type Agent struct {
 // с схемой, например http://localhost:8080.
 // Пустой key отключает подпись HashSHA256; rateLimit <= 0 трактуется как 1.
 //
+// Адрес хоста для заголовка X-Real-IP определяется один раз при создании
+// агента (HostIP): он не меняется, а запросов много.
+//
 // Асимметричное шифрование включается отдельно методом SetCryptoKey.
 func NewAgent(serverAddr string, pollInterval, reportInterval, rateLimit int, key string) *Agent {
 	if rateLimit <= 0 {
 		rateLimit = 1
 	}
 	return &Agent{
-		collector:      NewCollector(),
-		serverAddr:     serverAddr,
-		pollInterval:   pollInterval,
-		reportInterval: reportInterval,
-		rateLimit:      rateLimit,
-		key:            key,
-		client:         &http.Client{Timeout: 5 * time.Second},
-		flushTimeout:   defaultFlushTimeout,
+		collector:       NewCollector(),
+		serverAddr:      serverAddr,
+		pollInterval:    pollInterval,
+		reportInterval:  reportInterval,
+		rateLimit:       rateLimit,
+		key:             key,
+		hostIP:          HostIP(),
+		client:          &http.Client{Timeout: 5 * time.Second},
+		flushTimeout:    defaultFlushTimeout,
 		shutdownTimeout: defaultShutdownTimeout,
 	}
 }
@@ -585,6 +646,13 @@ func (a *Agent) newRequest(ctx context.Context, url string, payload []byte, head
 	}
 
 	req.Header = headers.Clone()
+	// X-Real-IP нужен серверу, чтобы сверить агента с доверенной подсетью.
+	// Запросы к серверу без trusted_subnet этот заголовок просто игнорируют.
+	ip := a.hostIP
+	if ip == "" {
+		ip = HostIP()
+	}
+	req.Header.Set(HeaderRealIP, ip)
 	if a.key != "" {
 		req.Header.Set("HashSHA256", hash.Compute(payload, a.key))
 	}

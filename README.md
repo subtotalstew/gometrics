@@ -7,6 +7,7 @@
 
 - [Запуск](#запуск)
 - [Файл конфигурации](#файл-конфигурации)
+- [Доверенная подсеть](#доверенная-подсеть)
 - [Асимметричное шифрование](#асимметричное-шифрование)
 - [Сборка с версией](#сборка-с-версией)
 - [Тесты и покрытие](#тесты-и-покрытие)
@@ -41,7 +42,8 @@ go run ./cmd/agent -a=localhost:8080 -p=2 -r=10
     "store_interval": "1s",
     "store_file": "/path/to/file.db",
     "database_dsn": "",
-    "crypto_key": "/path/to/key.pem"
+    "crypto_key": "/path/to/key.pem",
+    "trusted_subnet": "192.168.0.0/24"
 }
 ```
 
@@ -62,7 +64,43 @@ CONFIG=agent.json go run ./cmd/agent
 Интервалы записываются в формате длительности Go (`1s`, `500ms`), но
 принимается и простое число секунд — как у флагов. Кроме полей из примеров
 поддерживаются остальные опции: `key`, `audit_file`, `audit_url`,
-`pprof_addr` у сервера и `key`, `rate_limit` у агента.
+`pprof_addr`, `trusted_subnet` у сервера и `key`, `rate_limit` у агента.
+
+## Доверенная подсеть
+
+Сервер может принимать метрики только из заданной подсети. Агент сообщает
+свой IP-адрес в заголовке `X-Real-IP`, а сервер сверяет его с CIDR-подсетью
+и отвечает `403 Forbidden`, если адрес вне её или заголовка нет.
+
+| | флаг | переменная окружения | поле JSON |
+|---|---|---|---|
+| сервер | `-t` | `TRUSTED_SUBNET` | `trusted_subnet` |
+
+```bash
+# только агенты из 192.168.0.0/24 (CIDR, не одиночный адрес)
+go run ./cmd/server -a=localhost:8080 -t=192.168.0.0/24
+TRUSTED_SUBNET=10.0.0.0/8 go run ./cmd/server
+
+# без ограничений: пустое значение по умолчанию
+go run ./cmd/server -t=
+```
+
+Как это устроено:
+
+- проверяются только запросы записи метрик: `POST /update`,
+  `POST /update/`, `POST /update/{type}/{name}/{value}`, `POST /updates`,
+  `POST /updates/`; чтение (`GET /`, `GET /value/...`, `POST /value`, `/ping`)
+  доступно как раньше;
+- `X-Real-IP` должен содержать именно IP-адрес, без порта и схемы
+  (`192.168.1.42`, `fd00::1`);
+- пустой `trusted_subnet` (значение по умолчанию) отключает проверку: метрики
+  принимаются от любого адреса, а `X-Real-IP` игнорируется;
+- неверный CIDR — ошибка запуска сервера: опечатка в конфигурации не должна
+  молча отключать ограничение;
+- адрес хоста агент определяет один раз при старте (адрес маршрута наружу,
+  иначе первый не-loopback IPv4, иначе `127.0.0.1`) — см. `agent.HostIP`;
+- реализация на сервере — `handler.SetTrustedSubnet` и
+  `handler.TrustedSubnetMiddleware`.
 
 ## Асимметричное шифрование
 
@@ -201,29 +239,32 @@ go test ./... -count=1 -coverprofile=coverage.out
 go tool cover -func=coverage.out | tail -1
 ```
 
-Текущее покрытие — **64.2%** (требование спринта — не менее 40%):
+Текущее покрытие — **73.1%** (цель — не менее 70%):
 
 ```
-github.com/subtotalstew/gometrics.git/cmd/agent                   65.5%
-github.com/subtotalstew/gometrics.git/cmd/reset                    0.0%
-github.com/subtotalstew/gometrics.git/cmd/server                  39.5%
+github.com/subtotalstew/gometrics.git/cmd/agent                   71.8%
+github.com/subtotalstew/gometrics.git/cmd/reset                   88.5%
+github.com/subtotalstew/gometrics.git/cmd/server                  44.0%
 github.com/subtotalstew/gometrics.git/cmd/staticlint               0.0%
-github.com/subtotalstew/gometrics.git/internal/agent              66.7%
+github.com/subtotalstew/gometrics.git/internal/agent              61.7%
 github.com/subtotalstew/gometrics.git/internal/analysis/noosexit  82.5%
 github.com/subtotalstew/gometrics.git/internal/audit              92.3%
+github.com/subtotalstew/gometrics.git/internal/config             79.5%
 github.com/subtotalstew/gometrics.git/internal/crypto             90.7%
-github.com/subtotalstew/gometrics.git/internal/handler            78.8%
+github.com/subtotalstew/gometrics.git/internal/handler            81.1%
 github.com/subtotalstew/gometrics.git/internal/hash              100.0%
 github.com/subtotalstew/gometrics.git/internal/loadgen            85.3%
 github.com/subtotalstew/gometrics.git/internal/pool              100.0%
 github.com/subtotalstew/gometrics.git/internal/profiler          100.0%
-github.com/subtotalstew/gometrics.git/internal/retry              53.8%
+github.com/subtotalstew/gometrics.git/internal/retry              88.9%
 github.com/subtotalstew/gometrics.git/internal/storage            61.2%
-total:                                                            64.2%
+total:                                                            73.1%
 ```
 
-`cmd/reset` и `cmd/staticlint` — утилиты без тестов; `internal/models` содержит только
-объявления структур, поэтому в отчёте он отсутствует.
+`cmd/staticlint` — утилита без тестов; `internal/models` содержит только
+объявления структур, поэтому в отчёте он отсутствует. `cmd/server` ниже
+остальных пакетов из-за `serve`: запуск сервера и graceful shutdown
+проверяются вручную, автотестами покрыты конфигурация и маршрутизация.
 
 ## Бенчмарки
 
@@ -486,6 +527,7 @@ ROUTINE ======================== github.com/subtotalstew/gometrics.git/internal/
 
 ```
 cmd/server, cmd/agent   – точки входа сервиса и агента
+cmd/reset               – генератор методов Reset() по директиве // generate:reset
 internal/handler        – HTTP-хендлеры и middleware (gzip, логи, подпись)
 internal/storage        – хранилища: память, файл, PostgreSQL
 internal/agent          – сбор и отправка метрик
