@@ -15,7 +15,7 @@ import (
 var envKeys = []string{
 	"CONFIG", "ADDRESS", "STORE_INTERVAL", "FILE_STORAGE_PATH", "RESTORE",
 	"DATABASE_DSN", "KEY", "CRYPTO_KEY", "AUDIT_FILE", "AUDIT_URL", "PPROF_ADDR",
-	"TRUSTED_SUBNET",
+	"TRUSTED_SUBNET", "GRPC_ADDRESS",
 }
 
 // --- config ---
@@ -54,6 +54,9 @@ func TestLoadConfigFrom_Defaults(t *testing.T) {
 	if cfg.trustedSubnet != "" {
 		t.Errorf("trustedSubnet = %q, want empty", cfg.trustedSubnet)
 	}
+	if cfg.grpcAddr != "" {
+		t.Errorf("grpcAddr = %q, want empty (gRPC disabled)", cfg.grpcAddr)
+	}
 }
 
 func TestLoadConfigFrom_EnvOverridesFlags(t *testing.T) {
@@ -76,6 +79,7 @@ func TestLoadConfigFrom_EnvOverridesFlags(t *testing.T) {
 	_ = os.Setenv("AUDIT_URL", "http://audit.example")
 	_ = os.Setenv("PPROF_ADDR", "localhost:6060")
 	_ = os.Setenv("TRUSTED_SUBNET", "192.168.0.0/16")
+	_ = os.Setenv("GRPC_ADDRESS", "localhost:9090")
 
 	cfg, err := loadConfigFromArgs()
 	if err != nil {
@@ -113,6 +117,9 @@ func TestLoadConfigFrom_EnvOverridesFlags(t *testing.T) {
 	}
 	if cfg.trustedSubnet != "192.168.0.0/16" {
 		t.Errorf("trustedSubnet = %q, want 192.168.0.0/16", cfg.trustedSubnet)
+	}
+	if cfg.grpcAddr != "localhost:9090" {
+		t.Errorf("grpcAddr = %q, want localhost:9090", cfg.grpcAddr)
 	}
 }
 
@@ -209,6 +216,35 @@ func TestLoadConfigFrom_TrustedSubnetFlag(t *testing.T) {
 	}
 }
 
+// TestLoadConfigFrom_GRPCAddressFlag проверяет флаг -g (и его алиас
+// -grpc-address): адрес, на котором сервер поднимает gRPC.
+func TestLoadConfigFrom_GRPCAddressFlag(t *testing.T) {
+	saved := saveEnv()
+	defer restoreEnv(saved)
+	clearEnv()
+
+	oldArgs := os.Args
+	defer func() { os.Args = oldArgs }()
+
+	os.Args = []string{"server", "-g", "localhost:9090"}
+	cfg, err := loadConfigFromArgs()
+	if err != nil {
+		t.Fatalf("loadConfigFromArgs() error = %v", err)
+	}
+	if cfg.grpcAddr != "localhost:9090" {
+		t.Errorf("grpcAddr = %q, want localhost:9090", cfg.grpcAddr)
+	}
+
+	os.Args = []string{"server", "-grpc-address", "localhost:9091"}
+	cfg, err = loadConfigFromArgs()
+	if err != nil {
+		t.Fatalf("loadConfigFromArgs() error = %v", err)
+	}
+	if cfg.grpcAddr != "localhost:9091" {
+		t.Errorf("grpcAddr = %q, want localhost:9091", cfg.grpcAddr)
+	}
+}
+
 // --- файл конфигурации ---
 
 // TestLoadConfigFrom_FileConfig проверяет, что все опции сервера
@@ -229,7 +265,8 @@ func TestLoadConfigFrom_FileConfig(t *testing.T) {
 		"audit_file": "/tmp/file-audit.log",
 		"audit_url": "http://file-audit",
 		"pprof_addr": "localhost:7070",
-		"trusted_subnet": "172.16.0.0/12"
+		"trusted_subnet": "172.16.0.0/12",
+		"grpc_address": "localhost:9092"
 	}`)
 
 	oldArgs := os.Args
@@ -272,6 +309,9 @@ func TestLoadConfigFrom_FileConfig(t *testing.T) {
 	}
 	if cfg.trustedSubnet != "172.16.0.0/12" {
 		t.Errorf("trustedSubnet = %q, want 172.16.0.0/12", cfg.trustedSubnet)
+	}
+	if cfg.grpcAddr != "localhost:9092" {
+		t.Errorf("grpcAddr = %q, want localhost:9092", cfg.grpcAddr)
 	}
 }
 

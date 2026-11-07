@@ -16,6 +16,7 @@ type fileConfig struct {
 	CryptoKey      *string `json:"crypto_key"`
 	Key            *string `json:"key"`
 	RateLimit      *int    `json:"rate_limit"`
+	GRPCAddress    *string `json:"grpc_address"`
 }
 
 // applyFileConfig накладывает значения из файла на cfg.
@@ -35,6 +36,12 @@ func applyFileConfig(cfg *config, path string, set func(name string) bool) error
 	fileconfig.ApplyIf(&cfg.cryptoKey, fc.CryptoKey, set, "crypto-key")
 	fileconfig.ApplyIf(&cfg.key, fc.Key, set, "k")
 	fileconfig.ApplyIf(&cfg.rateLimit, fc.RateLimit, set, "l")
+
+	// У флага два имени (-g и -grpc-address): файл не должен перекрывать
+	// значение, если задано любое из них.
+	if !set("g") && !set("grpc-address") && fc.GRPCAddress != nil {
+		cfg.grpcAddr = *fc.GRPCAddress
+	}
 
 	if err := fileconfig.ApplyValue(&cfg.reportInterval, fc.ReportInterval, set, "r", fileconfig.ParseSeconds); err != nil {
 		return err

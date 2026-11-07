@@ -1,7 +1,8 @@
 // Package agent собирает метрики рантайма и системы (gopsutil) и отправляет
-// их на сервер метрик батчами через POST /updates/ (gzip + подпись HMAC,
-// опционально асимметричное шифрование тела запроса). В каждом запросе
-// отправляется заголовок X-Real-IP с адресом хоста агента — по нему сервер
+// их на сервер метрик батчами: по HTTP через POST /updates/ (gzip + подпись
+// HMAC, опционально асимметричное шифрование тела запроса) или по gRPC
+// (Metrics.UpdateMetrics), если задан адрес gRPC-сервера. IP-адрес агента
+// передаётся в заголовке X-Real-IP или метаданных x-real-ip — по нему сервер
 // проверяет, что агент входит в доверенную подсеть (trusted_subnet).
 package agent
 
@@ -29,6 +30,7 @@ import (
 	"github.com/shirou/gopsutil/v3/mem"
 
 	"github.com/subtotalstew/gometrics.git/internal/crypto"
+	"github.com/subtotalstew/gometrics.git/internal/grpcagent"
 	"github.com/subtotalstew/gometrics.git/internal/hash"
 	"github.com/subtotalstew/gometrics.git/internal/models"
 	"github.com/subtotalstew/gometrics.git/internal/retry"
@@ -106,6 +108,16 @@ func HostIP() string {
 	}
 
 	return "127.0.0.1"
+}
+
+// realIP возвращает адрес хоста агента для заголовка X-Real-IP (HTTP)
+// и метаданных x-real-ip (gRPC). Если адрес не был определён при создании
+// (агент собран не через NewAgent), он вычисляется при первом запросе.
+func (a *Agent) realIP() string {
+	if a.hostIP != "" {
+		return a.hostIP
+	}
+	return HostIP()
 }
 
 // Collector накапливает метрики в памяти: gauge — текущие значения
@@ -221,7 +233,6 @@ func (c *Collector) GetCounter() map[string]int64 {
 // Agent собирает метрики по расписанию и отправляет их на сервер метрик
 // пулом воркеров. Один Agent соответствует одному запущенному процессу агента.
 type Agent struct {
-	mu             sync.RWMutex
 	collector      *Collector
 	serverAddr     string
 	pollInterval   int
@@ -231,6 +242,9 @@ type Agent struct {
 	pubKey         *rsa.PublicKey
 	hostIP         string
 	client         *http.Client
+
+	// grpc != nil — метрики отправляются по gRPC (см. SetGRPC).
+	grpc *grpcagent.Client
 
 	// dirty — были ли измерения после последнего снимка, поставленного
 	// в очередь отправки. Нужен, чтобы при остановке не отправлять
@@ -563,6 +577,17 @@ func (a *Agent) worker(ctx context.Context, id int, jobs <-chan []models.Metrics
 }
 
 func (a *Agent) sendMetricsBatch(ctx context.Context, metrics []models.Metrics) {
+	// Если настроен gRPC-транспорт, JSON/gzip/подпись не нужны: батч уходит
+	// protobuf-сообщением, а IP агента — в метаданных.
+	if a.grpc != nil {
+		if err := a.grpc.SendMetrics(ctx, a.realIP(), metrics); err != nil {
+			log.Error().Err(err).Int("count", len(metrics)).Msg("failed to send metrics batch via gRPC after retries")
+			return
+		}
+		log.Info().Int("count", len(metrics)).Msg("metrics batch sent successfully via gRPC")
+		return
+	}
+
 	body, err := json.Marshal(metrics)
 	if err != nil {
 		log.Error().Err(err).Int("count", len(metrics)).Msg("failed to marshal metrics batch")
@@ -648,11 +673,7 @@ func (a *Agent) newRequest(ctx context.Context, url string, payload []byte, head
 	req.Header = headers.Clone()
 	// X-Real-IP нужен серверу, чтобы сверить агента с доверенной подсетью.
 	// Запросы к серверу без trusted_subnet этот заголовок просто игнорируют.
-	ip := a.hostIP
-	if ip == "" {
-		ip = HostIP()
-	}
-	req.Header.Set(HeaderRealIP, ip)
+	req.Header.Set(HeaderRealIP, a.realIP())
 	if a.key != "" {
 		req.Header.Set("HashSHA256", hash.Compute(payload, a.key))
 	}

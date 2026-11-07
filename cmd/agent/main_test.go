@@ -16,6 +16,7 @@ var envKeys = []string{
 	"KEY",
 	"CRYPTO_KEY",
 	"RATE_LIMIT",
+	"GRPC_ADDRESS",
 }
 
 // TestLoadConfig_Defaults проверяет значения по умолчанию, когда
@@ -52,6 +53,9 @@ func TestLoadConfig_Defaults(t *testing.T) {
 	if cfg.rateLimit != 1 {
 		t.Errorf("rateLimit = %d, want 1", cfg.rateLimit)
 	}
+	if cfg.grpcAddr != "" {
+		t.Errorf("grpcAddr = %q, want empty (HTTP transport)", cfg.grpcAddr)
+	}
 }
 
 // TestLoadConfig_FromEnv проверяет, что переменные окружения
@@ -83,6 +87,9 @@ func TestLoadConfig_FromEnv(t *testing.T) {
 	if err := os.Setenv("RATE_LIMIT", "3"); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Setenv("GRPC_ADDRESS", "localhost:9090"); err != nil {
+		t.Fatal(err)
+	}
 
 	cfg, err := loadConfigFromArgs()
 	if err != nil {
@@ -105,6 +112,9 @@ func TestLoadConfig_FromEnv(t *testing.T) {
 	}
 	if cfg.rateLimit != 3 {
 		t.Errorf("rateLimit = %d, want 3", cfg.rateLimit)
+	}
+	if cfg.grpcAddr != "localhost:9090" {
+		t.Errorf("grpcAddr = %q, want localhost:9090", cfg.grpcAddr)
 	}
 }
 
@@ -215,7 +225,7 @@ func TestLoadConfigFrom_FlagsOverrideDefaults(t *testing.T) {
 
 	oldArgs := os.Args
 	os.Args = []string{"agent", "-a", "flagaddr:1234", "-p", "7", "-r", "21", "-k", "flagkey", "-l", "4",
-		"-crypto-key", "/tmp/flag-public.pem"}
+		"-crypto-key", "/tmp/flag-public.pem", "-grpc-address", "localhost:9090"}
 	defer func() { os.Args = oldArgs }()
 
 	cfg, err := loadConfigFromArgs()
@@ -239,6 +249,9 @@ func TestLoadConfigFrom_FlagsOverrideDefaults(t *testing.T) {
 	}
 	if cfg.rateLimit != 4 {
 		t.Errorf("rateLimit = %d, want 4", cfg.rateLimit)
+	}
+	if cfg.grpcAddr != "localhost:9090" {
+		t.Errorf("grpcAddr = %q, want localhost:9090", cfg.grpcAddr)
 	}
 }
 
@@ -287,7 +300,8 @@ func TestLoadConfig_FileConfig(t *testing.T) {
 		"poll_interval": "3s",
 		"crypto_key": "/tmp/file.pem",
 		"key": "filekey",
-		"rate_limit": 5
+		"rate_limit": 5,
+		"grpc_address": "localhost:9095"
 	}`)
 
 	oldArgs := os.Args
@@ -315,6 +329,9 @@ func TestLoadConfig_FileConfig(t *testing.T) {
 	}
 	if cfg.rateLimit != 5 {
 		t.Errorf("rateLimit = %d, want 5", cfg.rateLimit)
+	}
+	if cfg.grpcAddr != "localhost:9095" {
+		t.Errorf("grpcAddr = %q, want localhost:9095", cfg.grpcAddr)
 	}
 }
 

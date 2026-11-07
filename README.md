@@ -1,13 +1,14 @@
 # go-musthave-metrics-tpl
 
-Сервис сбора метрик и алертинга: HTTP-сервер (`cmd/server`) принимает метрики от
-агента (`cmd/agent`), хранит их в памяти, в файле или в PostgreSQL и отдаёт по
-запросу. Поддерживаются сжатие gzip, подпись HMAC-SHA256, асимметричное
-шифрование тела запроса и аудит.
+Сервис сбора метрик и алертинга: сервер (`cmd/server`) принимает метрики от
+агента (`cmd/agent`) по HTTP и gRPC, хранит их в памяти, в файле или в
+PostgreSQL и отдаёт по запросу. Поддерживаются сжатие gzip, подпись
+HMAC-SHA256, асимметричное шифрование тела запроса и аудит.
 
 - [Запуск](#запуск)
 - [Файл конфигурации](#файл-конфигурации)
 - [Доверенная подсеть](#доверенная-подсеть)
+- [gRPC-транспорт](#grpc-транспорт)
 - [Асимметричное шифрование](#асимметричное-шифрование)
 - [Сборка с версией](#сборка-с-версией)
 - [Тесты и покрытие](#тесты-и-покрытие)
@@ -26,6 +27,10 @@ go run ./cmd/server -a=localhost:8080 -f= -i=300 -pprof-addr=localhost:6060
 
 # агент
 go run ./cmd/agent -a=localhost:8080 -p=2 -r=10
+
+# сервер с gRPC и агент, который отправляет метрики по gRPC
+go run ./cmd/server -a=localhost:8080 -g=localhost:9090
+go run ./cmd/agent -g=localhost:9090 -p=2 -r=10
 ```
 
 ## Файл конфигурации
@@ -43,7 +48,8 @@ go run ./cmd/agent -a=localhost:8080 -p=2 -r=10
     "store_file": "/path/to/file.db",
     "database_dsn": "",
     "crypto_key": "/path/to/key.pem",
-    "trusted_subnet": "192.168.0.0/24"
+    "trusted_subnet": "192.168.0.0/24",
+    "grpc_address": "localhost:9090"
 }
 ```
 
@@ -52,7 +58,8 @@ go run ./cmd/agent -a=localhost:8080 -p=2 -r=10
     "address": "localhost:8080",
     "report_interval": "1s",
     "poll_interval": "1s",
-    "crypto_key": "/path/to/key.pem"
+    "crypto_key": "/path/to/key.pem",
+    "grpc_address": "localhost:9090"
 }
 ```
 
@@ -64,7 +71,8 @@ CONFIG=agent.json go run ./cmd/agent
 Интервалы записываются в формате длительности Go (`1s`, `500ms`), но
 принимается и простое число секунд — как у флагов. Кроме полей из примеров
 поддерживаются остальные опции: `key`, `audit_file`, `audit_url`,
-`pprof_addr`, `trusted_subnet` у сервера и `key`, `rate_limit` у агента.
+`pprof_addr`, `trusted_subnet`, `grpc_address` у сервера и `key`,
+`rate_limit`, `grpc_address` у агента.
 
 ## Доверенная подсеть
 
@@ -101,6 +109,62 @@ go run ./cmd/server -t=
   иначе первый не-loopback IPv4, иначе `127.0.0.1`) — см. `agent.HostIP`;
 - реализация на сервере — `handler.SetTrustedSubnet` и
   `handler.TrustedSubnetMiddleware`.
+
+## gRPC-транспорт
+
+Помимо HTTP агент умеет отправлять метрики батчами по gRPC. Контракт описан
+в [metrics.proto](metrics.proto) (сервис `metrics.Metrics`, метод
+`UpdateMetrics`), сгенерированный код лежит в
+[internal/proto](internal/proto/metrics_grpc.pb.go), сервер — в
+[internal/grpcserver](internal/grpcserver/server.go), клиент — в
+[internal/grpcagent](internal/grpcagent/client.go).
+
+| | флаг | переменная окружения | поле JSON | смысл |
+|---|---|---|---|---|
+| сервер | `-g`, `-grpc-address` | `GRPC_ADDRESS` | `grpc_address` | адрес, на котором слушает gRPC |
+| агент | `-g`, `-grpc-address` | `GRPC_ADDRESS` | `grpc_address` | адрес сервера, к которому подключаться |
+
+```bash
+# сервер поднимает HTTP (8080) и gRPC (9090)
+go run ./cmd/server -a=localhost:8080 -g=localhost:9090 -t=192.168.0.0/24
+
+# агент отправляет батчи по gRPC; ключи/шифрование для gRPC не нужны
+go run ./cmd/agent -g=localhost:9090 -p=2 -r=10
+```
+
+Как это устроено:
+
+- пустой `grpc_address` (по умолчанию) отключает gRPC: сервер работает только
+  по HTTP, агент — по HTTP. Заданный адрес переключает агент на gRPC;
+- агент собирает `UpdateMetricsRequest` из того же снимка метрик, что и для
+  HTTP (`buildBatch`), а отправкой занимается `grpcagent.Client.SendMetrics`;
+  повторные попытки — при кодах `Unavailable`, `DeadlineExceeded` и
+  `ResourceExhausted` (см. `isRetriableGRPCError` в `internal/grpcagent`);
+- IP агента передаётся в метаданных `x-real-ip`. На сервере
+  `TrustedSubnetInterceptor` (UnaryInterceptor) читает их и сверяет адрес с
+  `trusted_subnet`;
+- транспорт изолирован: `internal/agent` отвечает за сбор, расписание и выбор
+  транспорта, `internal/grpcagent` — за соединение, метаданные, конвертацию
+  метрик и ретраи, `internal/grpcserver` — за приём и проверку подсети;
+- при несовпадении сервер возвращает ошибку с кодом
+  `codes.PermissionDenied`; при пустом `trusted_subnet` проверка отключается,
+  как и для HTTP;
+- gRPC-сервер использует то же хранилище, что и HTTP: батч проверяется целиком
+  до записи, затем вызывается синхронное сохранение (если включено);
+- gRPC не использует HMAC-подпись, gzip и асимметричное шифрование тела:
+  это настройки HTTP-транспорта. Для учебного проекта соединение открытое
+  (insecure), ограничение доступа — доверенная подсеть.
+
+Перегенерация кода после правки `metrics.proto`:
+
+```bash
+protoc --proto_path=. \
+  --go_out=. --go_opt=module=github.com/subtotalstew/gometrics.git \
+  --go-grpc_out=. --go-grpc_opt=module=github.com/subtotalstew/gometrics.git \
+  metrics.proto
+```
+
+Нужны `protoc` (проверено на 29.3), `protoc-gen-go` и `protoc-gen-go-grpc`.
 
 ## Асимметричное шифрование
 
@@ -239,30 +303,34 @@ go test ./... -count=1 -coverprofile=coverage.out
 go tool cover -func=coverage.out | tail -1
 ```
 
-Текущее покрытие — **73.1%** (цель — не менее 70%):
+Текущее покрытие — **70.8%** (цель — не менее 70%):
 
 ```
-github.com/subtotalstew/gometrics.git/cmd/agent                   71.8%
+github.com/subtotalstew/gometrics.git/cmd/agent                   68.7%
 github.com/subtotalstew/gometrics.git/cmd/reset                   88.5%
-github.com/subtotalstew/gometrics.git/cmd/server                  44.0%
+github.com/subtotalstew/gometrics.git/cmd/server                  40.3%
 github.com/subtotalstew/gometrics.git/cmd/staticlint               0.0%
-github.com/subtotalstew/gometrics.git/internal/agent              61.7%
+github.com/subtotalstew/gometrics.git/internal/agent              69.6%
 github.com/subtotalstew/gometrics.git/internal/analysis/noosexit  82.5%
 github.com/subtotalstew/gometrics.git/internal/audit              92.3%
 github.com/subtotalstew/gometrics.git/internal/config             79.5%
 github.com/subtotalstew/gometrics.git/internal/crypto             90.7%
+github.com/subtotalstew/gometrics.git/internal/grpcagent          97.1%
+github.com/subtotalstew/gometrics.git/internal/grpcserver         97.9%
 github.com/subtotalstew/gometrics.git/internal/handler            81.1%
 github.com/subtotalstew/gometrics.git/internal/hash              100.0%
 github.com/subtotalstew/gometrics.git/internal/loadgen            85.3%
 github.com/subtotalstew/gometrics.git/internal/pool              100.0%
 github.com/subtotalstew/gometrics.git/internal/profiler          100.0%
+github.com/subtotalstew/gometrics.git/internal/proto               0.0%
 github.com/subtotalstew/gometrics.git/internal/retry              88.9%
 github.com/subtotalstew/gometrics.git/internal/storage            61.2%
-total:                                                            73.1%
+total:                                                            70.8%
 ```
 
-`cmd/staticlint` — утилита без тестов; `internal/models` содержит только
-объявления структур, поэтому в отчёте он отсутствует. `cmd/server` ниже
+`cmd/staticlint` — утилита без тестов, `internal/proto` — сгенерированный
+код (его поведение проверяется через `internal/agent` и `internal/grpcserver`),
+`internal/models` содержит только объявления структур. `cmd/server` ниже
 остальных пакетов из-за `serve`: запуск сервера и graceful shutdown
 проверяются вручную, автотестами покрыты конфигурация и маршрутизация.
 
@@ -528,9 +596,13 @@ ROUTINE ======================== github.com/subtotalstew/gometrics.git/internal/
 ```
 cmd/server, cmd/agent   – точки входа сервиса и агента
 cmd/reset               – генератор методов Reset() по директиве // generate:reset
+metrics.proto           – контракт gRPC-сервиса Metrics (UpdateMetrics)
+internal/proto          – сгенерированный по metrics.proto Go-код
+internal/grpcserver     – gRPC-сервер метрик и интерсептор trusted_subnet
+internal/grpcagent      – gRPC-клиент агента (соединение, метаданные, ретраи)
 internal/handler        – HTTP-хендлеры и middleware (gzip, логи, подпись)
 internal/storage        – хранилища: память, файл, PostgreSQL
-internal/agent          – сбор и отправка метрик
+internal/agent          – сбор метрик, расписание и выбор транспорта
 internal/audit          – аудит событий (файл, URL)
 internal/hash, retry    – подпись HMAC-SHA256 и повторные попытки
 internal/profiler       – HTTP-сервер с эндпоинтами net/http/pprof
