@@ -116,9 +116,7 @@ func GenerateSelfSigned() (tls.Certificate, []byte, error) {
 	if host, err := os.Hostname(); err == nil && host != "" {
 		tmpl.DNSNames = append(tmpl.DNSNames, host)
 	}
-	for _, addr := range localIPs() {
-		tmpl.IPAddresses = append(tmpl.IPAddresses, addr)
-	}
+	tmpl.IPAddresses = append(tmpl.IPAddresses, localIPs()...)
 
 	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	if err != nil {
