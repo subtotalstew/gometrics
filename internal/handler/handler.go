@@ -154,10 +154,18 @@ func (h *Handler) notifyAudit(r *http.Request, metricNames []string) {
 	h.audit.Notify(audit.WithNames(event))
 }
 
+// HasTrustedSubnet сообщает, задана ли доверенная подсеть. Маршрутизатор
+// использует это, чтобы подключать TrustedSubnetMiddleware только когда
+// проверка действительно нужна: при пустом trusted_subnet middleware в
+// цепочку не добавляется вовсе.
+func (h *Handler) HasTrustedSubnet() bool {
+	return h.trustedSubnet != nil
+}
+
 // TrustedSubnetMiddleware проверяет, что агент прислал в заголовке X-Real-IP
-// свой IP-адрес и этот адрес входит в доверенную подсеть. Если подсеть не
-// задана (SetTrustedSubnet не вызывался), middleware пропускает всё: при
-// пустом trusted_subnet метрики обрабатываются без ограничений.
+// свой IP-адрес и этот адрес входит в доверенную подсеть. Подключается только
+// при заданной подсети; nil-проверка оставлена для прямых вызовов в тестах и
+// на случай ручной регистрации.
 //
 // Отсутствующий или неразбираемый X-Real-IP считается недоверенным: прокси
 // без этого заголовка не должен получать доступ к записи метрик.
@@ -170,7 +178,9 @@ func (h *Handler) TrustedSubnetMiddleware(next http.Handler) http.Handler {
 
 		ip := net.ParseIP(strings.TrimSpace(r.Header.Get("X-Real-IP")))
 		if ip == nil || !h.trustedSubnet.Contains(ip) {
-			log.Warn().
+			// 403 — ошибка клиента, а не сбой сервера: на уровне Warn такие
+			// события только замусоривают лог, поэтому Debug.
+			log.Debug().
 				Str("x_real_ip", r.Header.Get("X-Real-IP")).
 				Str("trusted_subnet", h.trustedSubnet.String()).
 				Str("remote_addr", r.RemoteAddr).
@@ -644,7 +654,8 @@ func readLimitedBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
 // лимита и 500 в остальных случаях.
 func writeBodyError(w http.ResponseWriter, err error) {
 	if errors.Is(err, errBodyTooLarge) {
-		log.Warn().Int("limit", maxRequestBody).Msg("request body exceeds limit")
+		// 413 — ошибка клиента (слишком большое тело), а не сбой сервера.
+		log.Debug().Int("limit", maxRequestBody).Msg("request body exceeds limit")
 		http.Error(w, errBodyTooLarge.Error(), http.StatusRequestEntityTooLarge)
 		return
 	}
@@ -851,7 +862,9 @@ func (h *Handler) DecryptMiddleware(next http.Handler) http.Handler {
 		decrypted, err := crypto.Decrypt(h.cryptoKey, body)
 		if err != nil {
 			if errors.Is(err, crypto.ErrNotEnvelope) {
-				log.Warn().
+				// 400 — ошибка клиента: тело не зашифровано. Debug, чтобы
+				// не замусоривать лог на каждый такой запрос.
+				log.Debug().
 					Str("path", r.URL.Path).
 					Str("remote_addr", r.RemoteAddr).
 					Msg("request body is not encrypted")

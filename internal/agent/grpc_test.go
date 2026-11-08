@@ -2,9 +2,19 @@ package agent
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"math/big"
 	"net"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -33,7 +43,7 @@ func (s *captureMetricsServer) UpdateMetrics(ctx context.Context, req *pb.Update
 	s.meta = md
 	s.got = req.GetMetrics()
 
-	return &pb.UpdateMetricsResponse{}, nil
+	return pb.UpdateMetricsResponse_builder{}.Build(), nil
 }
 
 // startAgentTestServer поднимает gRPC-сервер на bufconn и возвращает клиент.
@@ -101,15 +111,31 @@ func TestSendMetricsBatch_GRPC(t *testing.T) {
 // TestSetGRPC и TestClose проверяют настройку и закрытие клиента.
 func TestSetGRPC(t *testing.T) {
 	a := NewAgent("http://unused", 1, 1, 1, "")
+	ca := writeTestCACert(t)
 
-	if err := a.SetGRPC(""); err != nil {
+	if err := a.SetGRPC("", ""); err != nil {
 		t.Fatalf("SetGRPC(\"\") error = %v", err)
 	}
 	if a.grpc != nil {
 		t.Fatal("SetGRPC(\"\") must not configure gRPC client")
 	}
 
-	if err := a.SetGRPC("localhost:18080"); err != nil {
+	if err := a.SetGRPC("localhost:18080", ""); err != nil {
+		t.Fatalf("SetGRPC() without CA error = %v", err)
+	}
+	if a.grpc == nil {
+		t.Fatal("SetGRPC() without CA did not configure gRPC client")
+	}
+	if err := a.Close(); err != nil {
+		t.Errorf("Close() error = %v", err)
+	}
+
+	missing := filepath.Join(t.TempDir(), "missing.pem")
+	if err := a.SetGRPC("localhost:18080", missing); err == nil {
+		t.Fatal("SetGRPC() with missing CA = nil, want error")
+	}
+
+	if err := a.SetGRPC("localhost:18080", ca); err != nil {
 		t.Fatalf("SetGRPC() error = %v", err)
 	}
 	if a.grpc == nil {
@@ -125,4 +151,35 @@ func TestSetGRPC(t *testing.T) {
 	if err := a.Close(); err != nil {
 		t.Errorf("second Close() error = %v", err)
 	}
+}
+
+// writeTestCACert создаёт минимальный самоподписанный сертификат во временном
+// каталоге: Dial проверяет, что CA-файл существует и разбирается.
+func writeTestCACert(t *testing.T) string {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey() error = %v", err)
+	}
+
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "grpc test CA"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("CreateCertificate() error = %v", err)
+	}
+
+	path := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(path, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	return path
 }

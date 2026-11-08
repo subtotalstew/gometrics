@@ -30,6 +30,7 @@ type config struct {
 	rateLimit      int
 	cryptoKey      string
 	grpcAddr       string
+	grpcTLSCA      string
 }
 
 var (
@@ -81,11 +82,14 @@ func run() error {
 	// Если задан адрес gRPC-сервера, метрики уходят по gRPC (батчем),
 	// иначе используется прежний HTTP-транспорт.
 	if cfg.grpcAddr != "" {
-		if err := a.SetGRPC(cfg.grpcAddr); err != nil {
+		if cfg.grpcTLSCA == "" {
+			log.Printf("agent: grpc_tls_ca не задан — TLS без проверки сертификата сервера")
+		}
+		if err := a.SetGRPC(cfg.grpcAddr, cfg.grpcTLSCA); err != nil {
 			return err
 		}
 		defer func() { _ = a.Close() }()
-		log.Printf("agent: транспорт gRPC, адрес %s", cfg.grpcAddr)
+		log.Printf("agent: транспорт gRPC (TLS), адрес %s", cfg.grpcAddr)
 	}
 
 	a.Run()
@@ -120,6 +124,7 @@ func loadConfigFrom(fs *flag.FlagSet) (config, error) {
 	fs.IntVar(&cfg.rateLimit, "l", 1, "max number of simultaneously outgoing requests to the server")
 	fs.StringVar(&cfg.grpcAddr, "g", "", "address of the gRPC server (empty = use HTTP transport)")
 	fs.StringVar(&cfg.grpcAddr, "grpc-address", "", "address of the gRPC server (alias for -g)")
+	fs.StringVar(&cfg.grpcTLSCA, "grpc-tls-ca", "", "path to PEM CA certificate used to verify the gRPC server")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		return config{}, err
@@ -167,6 +172,9 @@ func loadConfigFrom(fs *flag.FlagSet) (config, error) {
 	}
 	if v := os.Getenv("GRPC_ADDRESS"); v != "" {
 		cfg.grpcAddr = v
+	}
+	if v := os.Getenv("GRPC_TLS_CA"); v != "" {
+		cfg.grpcTLSCA = v
 	}
 
 	if cfg.pollInterval <= 0 {

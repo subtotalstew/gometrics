@@ -22,6 +22,8 @@ type fileConfig struct {
 	PprofAddr     *string `json:"pprof_addr"`
 	TrustedSubnet *string `json:"trusted_subnet"`
 	GRPCAddress   *string `json:"grpc_address"`
+	GRPCTLSCert   *string `json:"grpc_tls_cert"`
+	GRPCTLSKey    *string `json:"grpc_tls_key"`
 }
 
 // applyFileConfig накладывает значения из файла на cfg.
@@ -53,6 +55,8 @@ func applyFileConfig(cfg *config, path string, set func(name string) bool) error
 	if !set("g") && !set("grpc-address") && fc.GRPCAddress != nil {
 		cfg.grpcAddr = *fc.GRPCAddress
 	}
+	fileconfig.ApplyIf(&cfg.grpcTLSCert, fc.GRPCTLSCert, set, "grpc-tls-cert")
+	fileconfig.ApplyIf(&cfg.grpcTLSKey, fc.GRPCTLSKey, set, "grpc-tls-key")
 
 	// store_interval: 0 — особое значение (синхронное сохранение),
 	// поэтому разбирается отдельным парсером, который не пропускает

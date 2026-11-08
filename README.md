@@ -28,10 +28,13 @@ go run ./cmd/server -a=localhost:8080 -f= -i=300 -pprof-addr=localhost:6060
 # агент
 go run ./cmd/agent -a=localhost:8080 -p=2 -r=10
 
-# сервер с gRPC и агент, который отправляет метрики по gRPC
+# сервер с gRPC (сертификат генерируется автоматически) и агент
 go run ./cmd/server -a=localhost:8080 -g=localhost:9090
 go run ./cmd/agent -g=localhost:9090 -p=2 -r=10
 ```
+
+Если нужна проверка сертификата, а не только шифрование, сертификаты задаются
+явно — см. раздел [«gRPC-транспорт»](#grpc-транспорт).
 
 ## Файл конфигурации
 
@@ -49,7 +52,9 @@ go run ./cmd/agent -g=localhost:9090 -p=2 -r=10
     "database_dsn": "",
     "crypto_key": "/path/to/key.pem",
     "trusted_subnet": "192.168.0.0/24",
-    "grpc_address": "localhost:9090"
+    "grpc_address": "localhost:9090",
+    "grpc_tls_cert": "/path/to/grpc-server.crt",
+    "grpc_tls_key": "/path/to/grpc-server.key"
 }
 ```
 
@@ -59,7 +64,8 @@ go run ./cmd/agent -g=localhost:9090 -p=2 -r=10
     "report_interval": "1s",
     "poll_interval": "1s",
     "crypto_key": "/path/to/key.pem",
-    "grpc_address": "localhost:9090"
+    "grpc_address": "localhost:9090",
+    "grpc_tls_ca": "/path/to/grpc-server.crt"
 }
 ```
 
@@ -71,8 +77,9 @@ CONFIG=agent.json go run ./cmd/agent
 Интервалы записываются в формате длительности Go (`1s`, `500ms`), но
 принимается и простое число секунд — как у флагов. Кроме полей из примеров
 поддерживаются остальные опции: `key`, `audit_file`, `audit_url`,
-`pprof_addr`, `trusted_subnet`, `grpc_address` у сервера и `key`,
-`rate_limit`, `grpc_address` у агента.
+`pprof_addr`, `trusted_subnet`, `grpc_address`, `grpc_tls_cert`,
+`grpc_tls_key` у сервера и `key`, `rate_limit`, `grpc_address`,
+`grpc_tls_ca` у агента.
 
 ## Доверенная подсеть
 
@@ -122,20 +129,55 @@ go run ./cmd/server -t=
 | | флаг | переменная окружения | поле JSON | смысл |
 |---|---|---|---|---|
 | сервер | `-g`, `-grpc-address` | `GRPC_ADDRESS` | `grpc_address` | адрес, на котором слушает gRPC |
+| сервер | `-grpc-tls-cert` | `GRPC_TLS_CERT` | `grpc_tls_cert` | PEM-сертификат (или цепочка) сервера; пусто = сгенерировать |
+| сервер | `-grpc-tls-key` | `GRPC_TLS_KEY` | `grpc_tls_key` | PEM-ключ сервера; пусто = сгенерировать |
 | агент | `-g`, `-grpc-address` | `GRPC_ADDRESS` | `grpc_address` | адрес сервера, к которому подключаться |
+| агент | `-grpc-tls-ca` | `GRPC_TLS_CA` | `grpc_tls_ca` | PEM-сертификат CA; пусто = TLS без проверки сервера |
+
+gRPC всегда работает по TLS. Если сертификат и ключ не заданы, сервер
+генерирует самоподписанный сертификат в памяти (SAN: `localhost`, `127.0.0.1`,
+`::1`, имя хоста и локальные адреса), поэтому для запуска достаточно адреса:
 
 ```bash
-# сервер поднимает HTTP (8080) и gRPC (9090)
+# сервер: HTTP (8080) + gRPC по TLS (9090), сертификат сгенерирован
 go run ./cmd/server -a=localhost:8080 -g=localhost:9090 -t=192.168.0.0/24
 
-# агент отправляет батчи по gRPC; ключи/шифрование для gRPC не нужны
+# агент: CA не задан — TLS без проверки сертификата сервера
 go run ./cmd/agent -g=localhost:9090 -p=2 -r=10
 ```
+
+Для проверки сервера задайте сертификаты явно. Подойдёт самоподписанный
+сертификат с SAN `localhost` и `127.0.0.1`:
+
+```bash
+# сертификат сервера (самоподписанный, он же CA для агента)
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+  -keyout grpc-server.key -out grpc-server.crt \
+  -subj "/CN=localhost" \
+  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+
+# сервер с явными сертификатами
+go run ./cmd/server -a=localhost:8080 -g=localhost:9090 \
+  -grpc-tls-cert=grpc-server.crt -grpc-tls-key=grpc-server.key \
+  -t=192.168.0.0/24
+
+# агент: тот же сертификат как CA, проверка имени из адреса (localhost)
+go run ./cmd/agent -g=localhost:9090 -grpc-tls-ca=grpc-server.crt -p=2 -r=10
+```
+
+Важно про fallback: без `grpc_tls_ca` канал шифруется, но сервер **не
+аутентифицируется** (аналог `InsecureSkipVerify`), поэтому возможен MITM.
+Для продакшена задавайте cert/key и CA явно; в учебном запуске компромисс
+приемлем и сопровождается предупреждением в логах сервера и агента.
 
 Как это устроено:
 
 - пустой `grpc_address` (по умолчанию) отключает gRPC: сервер работает только
   по HTTP, агент — по HTTP. Заданный адрес переключает агент на gRPC;
+- TLS-настройка вынесена в `internal/grpctls`: `ServerCredentials` читает
+  файлы или генерирует самоподписанный сертификат, `ClientCredentials`
+  проверяет CA или включает режим без проверки; неполная пара cert/key —
+  ошибка запуска, а битый путь к CA — ошибка создания клиента;
 - агент собирает `UpdateMetricsRequest` из того же снимка метрик, что и для
   HTTP (`buildBatch`), а отправкой занимается `grpcagent.Client.SendMetrics`;
   повторные попытки — при кодах `Unavailable`, `DeadlineExceeded` и
@@ -144,22 +186,26 @@ go run ./cmd/agent -g=localhost:9090 -p=2 -r=10
   `TrustedSubnetInterceptor` (UnaryInterceptor) читает их и сверяет адрес с
   `trusted_subnet`;
 - транспорт изолирован: `internal/agent` отвечает за сбор, расписание и выбор
-  транспорта, `internal/grpcagent` — за соединение, метаданные, конвертацию
-  метрик и ретраи, `internal/grpcserver` — за приём и проверку подсети;
+  транспорта, `internal/grpcagent` — за соединение, TLS, метаданные,
+  конвертацию метрик и ретраи, `internal/grpcserver` — за приём и проверку
+  подсети;
 - при несовпадении сервер возвращает ошибку с кодом
   `codes.PermissionDenied`; при пустом `trusted_subnet` проверка отключается,
   как и для HTTP;
 - gRPC-сервер использует то же хранилище, что и HTTP: батч проверяется целиком
   до записи, затем вызывается синхронное сохранение (если включено);
 - gRPC не использует HMAC-подпись, gzip и асимметричное шифрование тела:
-  это настройки HTTP-транспорта. Для учебного проекта соединение открытое
-  (insecure), ограничение доступа — доверенная подсеть.
+  это настройки HTTP-транспорта, а целостность и конфиденциальность gRPC
+  обеспечивает TLS.
 
-Перегенерация кода после правки `metrics.proto`:
+Перегенерация кода после правки `metrics.proto` (используется OpaqueAPI:
+структуры собираются через `*_builder`, читаются через геттеры, прямых полей
+у сгенерированных типов нет):
 
 ```bash
 protoc --proto_path=. \
   --go_out=. --go_opt=module=github.com/subtotalstew/gometrics.git \
+  --go_opt=default_api_level=API_OPAQUE \
   --go-grpc_out=. --go-grpc_opt=module=github.com/subtotalstew/gometrics.git \
   metrics.proto
 ```
@@ -303,21 +349,22 @@ go test ./... -count=1 -coverprofile=coverage.out
 go tool cover -func=coverage.out | tail -1
 ```
 
-Текущее покрытие — **70.8%** (цель — не менее 70%):
+Текущее покрытие — **70.6%** (цель — не менее 70%):
 
 ```
-github.com/subtotalstew/gometrics.git/cmd/agent                   68.7%
+github.com/subtotalstew/gometrics.git/cmd/agent                   68.5%
 github.com/subtotalstew/gometrics.git/cmd/reset                   88.5%
-github.com/subtotalstew/gometrics.git/cmd/server                  40.3%
+github.com/subtotalstew/gometrics.git/cmd/server                  41.7%
 github.com/subtotalstew/gometrics.git/cmd/staticlint               0.0%
-github.com/subtotalstew/gometrics.git/internal/agent              69.6%
+github.com/subtotalstew/gometrics.git/internal/agent              69.9%
 github.com/subtotalstew/gometrics.git/internal/analysis/noosexit  82.5%
 github.com/subtotalstew/gometrics.git/internal/audit              92.3%
 github.com/subtotalstew/gometrics.git/internal/config             79.5%
 github.com/subtotalstew/gometrics.git/internal/crypto             90.7%
-github.com/subtotalstew/gometrics.git/internal/grpcagent          97.1%
-github.com/subtotalstew/gometrics.git/internal/grpcserver         97.9%
-github.com/subtotalstew/gometrics.git/internal/handler            81.1%
+github.com/subtotalstew/gometrics.git/internal/grpcagent          97.4%
+github.com/subtotalstew/gometrics.git/internal/grpcserver         98.0%
+github.com/subtotalstew/gometrics.git/internal/grpctls            83.6%
+github.com/subtotalstew/gometrics.git/internal/handler            80.9%
 github.com/subtotalstew/gometrics.git/internal/hash              100.0%
 github.com/subtotalstew/gometrics.git/internal/loadgen            85.3%
 github.com/subtotalstew/gometrics.git/internal/pool              100.0%
@@ -325,7 +372,7 @@ github.com/subtotalstew/gometrics.git/internal/profiler          100.0%
 github.com/subtotalstew/gometrics.git/internal/proto               0.0%
 github.com/subtotalstew/gometrics.git/internal/retry              88.9%
 github.com/subtotalstew/gometrics.git/internal/storage            61.2%
-total:                                                            70.8%
+total:                                                            70.6%
 ```
 
 `cmd/staticlint` — утилита без тестов, `internal/proto` — сгенерированный
@@ -600,6 +647,7 @@ metrics.proto           – контракт gRPC-сервиса Metrics (Update
 internal/proto          – сгенерированный по metrics.proto Go-код
 internal/grpcserver     – gRPC-сервер метрик и интерсептор trusted_subnet
 internal/grpcagent      – gRPC-клиент агента (соединение, метаданные, ретраи)
+internal/grpctls        – TLS для gRPC: файлы сертификатов и self-signed fallback
 internal/handler        – HTTP-хендлеры и middleware (gzip, логи, подпись)
 internal/storage        – хранилища: память, файл, PostgreSQL
 internal/agent          – сбор метрик, расписание и выбор транспорта

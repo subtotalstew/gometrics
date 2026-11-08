@@ -13,10 +13,10 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
+	"github.com/subtotalstew/gometrics.git/internal/grpctls"
 	"github.com/subtotalstew/gometrics.git/internal/models"
 	pb "github.com/subtotalstew/gometrics.git/internal/proto"
 	"github.com/subtotalstew/gometrics.git/internal/retry"
@@ -39,16 +39,26 @@ type Client struct {
 // Пустой addr — не ошибка: возвращается nil, nil, и вызывающая сторона
 // остаётся на HTTP-транспорте.
 //
+// Соединение всегда по TLS. caFile — PEM-сертификат CA (для самоподписанного
+// сертификата — сам сертификат сервера): тогда личность сервера проверяется.
+// Пустой caFile — fallback для запуска без файлов: канал шифруется, но
+// сертификат сервера не проверяется (см. grpctls.ClientCredentials).
+// Имя сервера для проверки берётся из addr (например, localhost), поэтому в
+// сертификате должен быть соответствующий SAN.
+//
 // grpc.NewClient не устанавливает TCP-соединение сразу: первый вызов
-// происходит при отправке метрик. TLS не используется — в учебном проекте
-// сервер и агент общаются внутри доверенной сети (доступ ограничивает
-// trusted_subnet на сервере).
-func Dial(addr string) (*Client, error) {
+// происходит при отправке метрик.
+func Dial(addr, caFile string) (*Client, error) {
 	if addr == "" {
 		return nil, nil
 	}
 
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	creds, err := grpctls.ClientCredentials(caFile)
+	if err != nil {
+		return nil, fmt.Errorf("grpcagent: %w", err)
+	}
+
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(creds))
 	if err != nil {
 		return nil, fmt.Errorf("grpcagent: не удалось создать клиент: %w", err)
 	}
@@ -70,7 +80,7 @@ func New(cc grpc.ClientConnInterface) *Client {
 // realIP уходит в метаданные x-real-ip: по нему UnaryInterceptor сервера
 // проверяет, что агент входит в доверенную подсеть.
 func (c *Client) SendMetrics(ctx context.Context, realIP string, metrics []models.Metrics) error {
-	req := &pb.UpdateMetricsRequest{Metrics: toProtoMetrics(metrics)}
+	req := pb.UpdateMetricsRequest_builder{Metrics: toProtoMetrics(metrics)}.Build()
 
 	sendOnce := func() error {
 		callCtx := metadata.AppendToOutgoingContext(ctx, MetadataRealIP, realIP)
@@ -110,6 +120,9 @@ func isRetriableGRPCError(err error) bool {
 }
 
 // toProtoMetrics переводит внутреннюю модель метрик в protobuf-сообщения.
+// Используется OpaqueAPI: у сгенерированных структур нет экспортируемых
+// полей, поэтому объекты собираются через билдеры, а читаются геттерами.
+//
 // Для gauge заполняется value, для counter — delta. Метрики неизвестного
 // типа пропускаются: агентский buildBatch создаёт только известные, а сервер
 // всё равно отклонил бы такой батч.
@@ -123,22 +136,22 @@ func toProtoMetrics(metrics []models.Metrics) []*pb.Metric {
 			if m.Value != nil {
 				value = *m.Value
 			}
-			result = append(result, &pb.Metric{
+			result = append(result, pb.Metric_builder{
 				Id:    m.ID,
 				Type:  pb.Metric_GAUGE,
 				Value: value,
-			})
+			}.Build())
 
 		case models.Counter:
 			var delta int64
 			if m.Delta != nil {
 				delta = *m.Delta
 			}
-			result = append(result, &pb.Metric{
+			result = append(result, pb.Metric_builder{
 				Id:    m.ID,
 				Type:  pb.Metric_COUNTER,
 				Delta: delta,
-			})
+			}.Build())
 		}
 	}
 

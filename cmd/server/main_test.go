@@ -15,7 +15,7 @@ import (
 var envKeys = []string{
 	"CONFIG", "ADDRESS", "STORE_INTERVAL", "FILE_STORAGE_PATH", "RESTORE",
 	"DATABASE_DSN", "KEY", "CRYPTO_KEY", "AUDIT_FILE", "AUDIT_URL", "PPROF_ADDR",
-	"TRUSTED_SUBNET", "GRPC_ADDRESS",
+	"TRUSTED_SUBNET", "GRPC_ADDRESS", "GRPC_TLS_CERT", "GRPC_TLS_KEY",
 }
 
 // --- config ---
@@ -57,6 +57,9 @@ func TestLoadConfigFrom_Defaults(t *testing.T) {
 	if cfg.grpcAddr != "" {
 		t.Errorf("grpcAddr = %q, want empty (gRPC disabled)", cfg.grpcAddr)
 	}
+	if cfg.grpcTLSCert != "" || cfg.grpcTLSKey != "" {
+		t.Errorf("grpc TLS = %q, %q; want empty", cfg.grpcTLSCert, cfg.grpcTLSKey)
+	}
 }
 
 func TestLoadConfigFrom_EnvOverridesFlags(t *testing.T) {
@@ -80,6 +83,8 @@ func TestLoadConfigFrom_EnvOverridesFlags(t *testing.T) {
 	_ = os.Setenv("PPROF_ADDR", "localhost:6060")
 	_ = os.Setenv("TRUSTED_SUBNET", "192.168.0.0/16")
 	_ = os.Setenv("GRPC_ADDRESS", "localhost:9090")
+	_ = os.Setenv("GRPC_TLS_CERT", "/tmp/grpc.crt")
+	_ = os.Setenv("GRPC_TLS_KEY", "/tmp/grpc.key")
 
 	cfg, err := loadConfigFromArgs()
 	if err != nil {
@@ -120,6 +125,9 @@ func TestLoadConfigFrom_EnvOverridesFlags(t *testing.T) {
 	}
 	if cfg.grpcAddr != "localhost:9090" {
 		t.Errorf("grpcAddr = %q, want localhost:9090", cfg.grpcAddr)
+	}
+	if cfg.grpcTLSCert != "/tmp/grpc.crt" || cfg.grpcTLSKey != "/tmp/grpc.key" {
+		t.Errorf("grpc TLS = %q, %q", cfg.grpcTLSCert, cfg.grpcTLSKey)
 	}
 }
 
@@ -226,13 +234,16 @@ func TestLoadConfigFrom_GRPCAddressFlag(t *testing.T) {
 	oldArgs := os.Args
 	defer func() { os.Args = oldArgs }()
 
-	os.Args = []string{"server", "-g", "localhost:9090"}
+	os.Args = []string{"server", "-g", "localhost:9090", "-grpc-tls-cert", "/tmp/cert.pem", "-grpc-tls-key", "/tmp/key.pem"}
 	cfg, err := loadConfigFromArgs()
 	if err != nil {
 		t.Fatalf("loadConfigFromArgs() error = %v", err)
 	}
 	if cfg.grpcAddr != "localhost:9090" {
 		t.Errorf("grpcAddr = %q, want localhost:9090", cfg.grpcAddr)
+	}
+	if cfg.grpcTLSCert != "/tmp/cert.pem" || cfg.grpcTLSKey != "/tmp/key.pem" {
+		t.Errorf("grpc TLS = %q, %q; want /tmp/cert.pem, /tmp/key.pem", cfg.grpcTLSCert, cfg.grpcTLSKey)
 	}
 
 	os.Args = []string{"server", "-grpc-address", "localhost:9091"}
@@ -266,7 +277,9 @@ func TestLoadConfigFrom_FileConfig(t *testing.T) {
 		"audit_url": "http://file-audit",
 		"pprof_addr": "localhost:7070",
 		"trusted_subnet": "172.16.0.0/12",
-		"grpc_address": "localhost:9092"
+		"grpc_address": "localhost:9092",
+		"grpc_tls_cert": "/tmp/file-grpc.crt",
+		"grpc_tls_key": "/tmp/file-grpc.key"
 	}`)
 
 	oldArgs := os.Args
@@ -312,6 +325,9 @@ func TestLoadConfigFrom_FileConfig(t *testing.T) {
 	}
 	if cfg.grpcAddr != "localhost:9092" {
 		t.Errorf("grpcAddr = %q, want localhost:9092", cfg.grpcAddr)
+	}
+	if cfg.grpcTLSCert != "/tmp/file-grpc.crt" || cfg.grpcTLSKey != "/tmp/file-grpc.key" {
+		t.Errorf("grpc TLS = %q, %q", cfg.grpcTLSCert, cfg.grpcTLSKey)
 	}
 }
 

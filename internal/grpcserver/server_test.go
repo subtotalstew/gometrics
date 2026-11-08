@@ -28,6 +28,20 @@ func (failingStorage) UpdateBatch([]models.Metrics) error {
 	return errors.New("storage is broken")
 }
 
+// gaugeMetric, counterMetric и batch собирают protobuf-объекты через билдеры:
+// OpaqueAPI не даёт создавать их struct-литералами с полями.
+func gaugeMetric(id string, value float64) *pb.Metric {
+	return pb.Metric_builder{Id: id, Type: pb.Metric_GAUGE, Value: value}.Build()
+}
+
+func counterMetric(id string, delta int64) *pb.Metric {
+	return pb.Metric_builder{Id: id, Type: pb.Metric_COUNTER, Delta: delta}.Build()
+}
+
+func batch(metrics ...*pb.Metric) *pb.UpdateMetricsRequest {
+	return pb.UpdateMetricsRequest_builder{Metrics: metrics}.Build()
+}
+
 // TestTrustedSubnetInterceptor проверяет проверку IP из метаданных.
 func TestTrustedSubnetInterceptor(t *testing.T) {
 	tests := []struct {
@@ -90,10 +104,10 @@ func TestServer_UpdateMetrics(t *testing.T) {
 	saved := 0
 	s := New(mem, func() { saved++ })
 
-	_, err := s.UpdateMetrics(context.Background(), &pb.UpdateMetricsRequest{Metrics: []*pb.Metric{
-		{Id: "g", Type: pb.Metric_GAUGE, Value: 1.5},
-		{Id: "c", Type: pb.Metric_COUNTER, Delta: 5},
-	}})
+	_, err := s.UpdateMetrics(context.Background(), batch(
+		gaugeMetric("g", 1.5),
+		counterMetric("c", 5),
+	))
 	if err != nil {
 		t.Fatalf("UpdateMetrics() error = %v", err)
 	}
@@ -116,7 +130,7 @@ func TestServer_UpdateMetrics_EmptyBatch(t *testing.T) {
 	saved := false
 	s := New(mem, func() { saved = true })
 
-	resp, err := s.UpdateMetrics(context.Background(), &pb.UpdateMetricsRequest{})
+	resp, err := s.UpdateMetrics(context.Background(), batch())
 	if err != nil {
 		t.Fatalf("UpdateMetrics() error = %v", err)
 	}
@@ -139,19 +153,19 @@ func TestServer_UpdateMetrics_Errors(t *testing.T) {
 		{
 			name: "empty id",
 			srv:  New(storage.NewMemStorage(), nil),
-			req:  &pb.UpdateMetricsRequest{Metrics: []*pb.Metric{{Type: pb.Metric_GAUGE}}},
+			req:  batch(pb.Metric_builder{Type: pb.Metric_GAUGE}.Build()),
 			code: codes.InvalidArgument,
 		},
 		{
 			name: "unknown type",
 			srv:  New(storage.NewMemStorage(), nil),
-			req:  &pb.UpdateMetricsRequest{Metrics: []*pb.Metric{{Id: "x", Type: pb.Metric_MType(99)}}},
+			req:  batch(pb.Metric_builder{Id: "x", Type: pb.Metric_MType(99)}.Build()),
 			code: codes.InvalidArgument,
 		},
 		{
 			name: "storage error",
 			srv:  New(failingStorage{}, nil),
-			req:  &pb.UpdateMetricsRequest{Metrics: []*pb.Metric{{Id: "x", Type: pb.Metric_GAUGE}}},
+			req:  batch(gaugeMetric("x", 1)),
 			code: codes.Internal,
 		},
 	}
@@ -203,9 +217,7 @@ func TestGRPC_EndToEnd(t *testing.T) {
 		defer cleanup()
 
 		ctx := metadata.AppendToOutgoingContext(context.Background(), MetadataRealIP, "10.1.2.3")
-		_, err := client.UpdateMetrics(ctx, &pb.UpdateMetricsRequest{Metrics: []*pb.Metric{
-			{Id: "g", Type: pb.Metric_GAUGE, Value: 2.5},
-		}})
+		_, err := client.UpdateMetrics(ctx, batch(gaugeMetric("g", 2.5)))
 		if err != nil {
 			t.Fatalf("UpdateMetrics() error = %v", err)
 		}
@@ -220,9 +232,7 @@ func TestGRPC_EndToEnd(t *testing.T) {
 		defer cleanup()
 
 		ctx := metadata.AppendToOutgoingContext(context.Background(), MetadataRealIP, "192.168.1.1")
-		_, err := client.UpdateMetrics(ctx, &pb.UpdateMetricsRequest{Metrics: []*pb.Metric{
-			{Id: "g", Type: pb.Metric_GAUGE, Value: 2.5},
-		}})
+		_, err := client.UpdateMetrics(ctx, batch(gaugeMetric("g", 2.5)))
 		if status.Code(err) != codes.PermissionDenied {
 			t.Fatalf("code = %v, want PermissionDenied (err = %v)", status.Code(err), err)
 		}
@@ -236,9 +246,7 @@ func TestGRPC_EndToEnd(t *testing.T) {
 		client, cleanup := startTestServer(t, mem, "")
 		defer cleanup()
 
-		_, err := client.UpdateMetrics(context.Background(), &pb.UpdateMetricsRequest{Metrics: []*pb.Metric{
-			{Id: "g", Type: pb.Metric_GAUGE, Value: 1},
-		}})
+		_, err := client.UpdateMetrics(context.Background(), batch(gaugeMetric("g", 1)))
 		if err != nil {
 			t.Fatalf("UpdateMetrics() error = %v", err)
 		}

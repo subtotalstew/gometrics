@@ -29,6 +29,7 @@ import (
 	"github.com/subtotalstew/gometrics.git/internal/audit"
 	fileconfig "github.com/subtotalstew/gometrics.git/internal/config"
 	"github.com/subtotalstew/gometrics.git/internal/grpcserver"
+	"github.com/subtotalstew/gometrics.git/internal/grpctls"
 	"github.com/subtotalstew/gometrics.git/internal/handler"
 	"github.com/subtotalstew/gometrics.git/internal/profiler"
 	"github.com/subtotalstew/gometrics.git/internal/storage"
@@ -60,6 +61,8 @@ type config struct {
 	pprofAddr     string
 	trustedSubnet string
 	grpcAddr      string
+	grpcTLSCert   string
+	grpcTLSKey    string
 }
 
 func main() {
@@ -119,6 +122,8 @@ func loadConfigFrom(fs *flag.FlagSet) (config, error) {
 	fs.StringVar(&cfg.trustedSubnet, "t", "", "trusted subnet in CIDR notation; metrics from other IPs are rejected with 403 (empty = no restriction)")
 	fs.StringVar(&cfg.grpcAddr, "g", "", "address and port to run the gRPC server (empty = disabled)")
 	fs.StringVar(&cfg.grpcAddr, "grpc-address", "", "address and port to run the gRPC server (alias for -g)")
+	fs.StringVar(&cfg.grpcTLSCert, "grpc-tls-cert", "", "path to PEM certificate (or certificate chain) for the gRPC server")
+	fs.StringVar(&cfg.grpcTLSKey, "grpc-tls-key", "", "path to PEM private key for the gRPC server")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		return config{}, err
@@ -178,6 +183,12 @@ func loadConfigFrom(fs *flag.FlagSet) (config, error) {
 	if v := os.Getenv("GRPC_ADDRESS"); v != "" {
 		cfg.grpcAddr = v
 	}
+	if v := os.Getenv("GRPC_TLS_CERT"); v != "" {
+		cfg.grpcTLSCert = v
+	}
+	if v := os.Getenv("GRPC_TLS_KEY"); v != "" {
+		cfg.grpcTLSKey = v
+	}
 	return cfg, nil
 }
 
@@ -205,9 +216,13 @@ func buildRouter(h *handler.Handler, key string) *chi.Mux {
 	r.Use(middleware.Recoverer)
 
 	// Запись метрик — в отдельной группе, потому что только эти маршруты
-	// проверяют доверенную подсеть.
+	// проверяют доверенную подсеть. Middleware подключается, только если
+	// подсеть действительно задана: при пустом trusted_subnet в цепочке
+	// не должно быть лишнего звена.
 	r.Group(func(r chi.Router) {
-		r.Use(h.TrustedSubnetMiddleware)
+		if h.HasTrustedSubnet() {
+			r.Use(h.TrustedSubnetMiddleware)
+		}
 
 		r.Post("/update", h.UpdateJSONHandler)
 		r.Post("/update/", h.UpdateJSONHandler)
@@ -365,7 +380,19 @@ func serve(cfg config) error {
 	grpcErr := make(chan error, 1)
 
 	if cfg.grpcAddr != "" {
-		gs, err := grpcserver.NewGRPCServer(metricsStorage, syncSave, cfg.trustedSubnet)
+		// gRPC работает только по TLS. Если сертификат и ключ не заданы,
+		// генерируется самоподписанный — этого достаточно для учебного
+		// запуска; для проверки сервера агенту нужен CA (или он работает
+		// без проверки сертификата).
+		tlsCreds, generated, err := grpctls.ServerCredentials(cfg.grpcTLSCert, cfg.grpcTLSKey)
+		if err != nil {
+			return fmt.Errorf("не удалось настроить TLS gRPC: %w", err)
+		}
+		if generated {
+			log.Warn().Msg("gRPC: файлы сертификата не заданы, сгенерирован самоподписанный TLS-сертификат")
+		}
+
+		gs, err := grpcserver.NewGRPCServer(metricsStorage, syncSave, cfg.trustedSubnet, grpc.Creds(tlsCreds))
 		if err != nil {
 			return err
 		}

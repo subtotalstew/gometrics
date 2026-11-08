@@ -2,18 +2,30 @@ package grpcagent
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
+	"math/big"
 	"net"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 
+	"github.com/subtotalstew/gometrics.git/internal/grpctls"
 	"github.com/subtotalstew/gometrics.git/internal/models"
 	pb "github.com/subtotalstew/gometrics.git/internal/proto"
 )
@@ -35,7 +47,7 @@ func (s *captureServer) UpdateMetrics(ctx context.Context, req *pb.UpdateMetrics
 	s.meta = md
 	s.got = req.GetMetrics()
 
-	return &pb.UpdateMetricsResponse{}, nil
+	return pb.UpdateMetricsResponse_builder{}.Build(), nil
 }
 
 // dialTestServer поднимает gRPC-сервер на bufconn и возвращает соединение.
@@ -117,14 +129,31 @@ func TestSendMetrics_NonRetriableError(t *testing.T) {
 	}
 }
 
-// TestDial проверяет создание клиента по адресу и закрытие соединения.
+// TestDial проверяет создание клиента по адресу: без CA используется fallback
+// (TLS без проверки сервера), с CA — обычная проверка.
 func TestDial(t *testing.T) {
-	empty, err := Dial("")
+	empty, err := Dial("", "")
 	if err != nil || empty != nil {
 		t.Fatalf("Dial(\"\") = %v, %v; want nil, nil", empty, err)
 	}
 
-	c, err := Dial("localhost:18080")
+	if _, err := Dial("localhost:18080", filepath.Join(t.TempDir(), "missing.pem")); err == nil {
+		t.Fatal("Dial() with missing CA file = nil, want error")
+	}
+
+	noCA, err := Dial("localhost:18080", "")
+	if err != nil {
+		t.Fatalf("Dial() without CA error = %v", err)
+	}
+	if noCA == nil || noCA.conn == nil {
+		t.Fatal("Dial() without CA did not create connection")
+	}
+	if err := noCA.Close(); err != nil {
+		t.Errorf("Close() error = %v", err)
+	}
+
+	certFile, _ := writeTestCert(t)
+	c, err := Dial("localhost:18080", certFile)
 	if err != nil {
 		t.Fatalf("Dial() error = %v", err)
 	}
@@ -137,6 +166,143 @@ func TestDial(t *testing.T) {
 	if err := c.Close(); err != nil {
 		t.Errorf("second Close() error = %v", err)
 	}
+}
+
+// TestDial_TLS проверяет реальное TLS-соединение: сервер с самоподписанным
+// сертификатом, клиент — с этим сертификатом как CA.
+func TestDial_TLS(t *testing.T) {
+	certFile, keyFile := writeTestCert(t)
+
+	creds, err := credentials.NewServerTLSFromFile(certFile, keyFile)
+	if err != nil {
+		t.Fatalf("NewServerTLSFromFile() error = %v", err)
+	}
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+
+	srv := &captureServer{}
+	gs := grpc.NewServer(grpc.Creds(creds))
+	pb.RegisterMetricsServer(gs, srv)
+	go func() {
+		_ = gs.Serve(lis)
+	}()
+	t.Cleanup(func() {
+		gs.Stop()
+		_ = lis.Close()
+	})
+
+	c, err := Dial(lis.Addr().String(), certFile)
+	if err != nil {
+		t.Fatalf("Dial() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	value := 3.5
+	if err := c.SendMetrics(context.Background(), "10.0.0.1", []models.Metrics{
+		{ID: "g", MType: models.Gauge, Value: &value},
+	}); err != nil {
+		t.Fatalf("SendMetrics() error = %v", err)
+	}
+
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if len(srv.got) != 1 || srv.got[0].GetId() != "g" {
+		t.Errorf("server received %v, want one metric g", srv.got)
+	}
+}
+
+// TestDial_TLSNoCA проверяет fallback: сервер сгенерировал самоподписанный
+// сертификат, агент без CA подключается по TLS без проверки сервера.
+func TestDial_TLSNoCA(t *testing.T) {
+	creds, generated, err := grpctls.ServerCredentials("", "")
+	if err != nil {
+		t.Fatalf("ServerCredentials() error = %v", err)
+	}
+	if !generated {
+		t.Fatal("ServerCredentials(\"\") did not generate a certificate")
+	}
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+
+	srv := &captureServer{}
+	gs := grpc.NewServer(grpc.Creds(creds))
+	pb.RegisterMetricsServer(gs, srv)
+	go func() {
+		_ = gs.Serve(lis)
+	}()
+	t.Cleanup(func() {
+		gs.Stop()
+		_ = lis.Close()
+	})
+
+	c, err := Dial(lis.Addr().String(), "")
+	if err != nil {
+		t.Fatalf("Dial() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	value := 4.5
+	if err := c.SendMetrics(context.Background(), "10.0.0.1", []models.Metrics{
+		{ID: "g", MType: models.Gauge, Value: &value},
+	}); err != nil {
+		t.Fatalf("SendMetrics() error = %v", err)
+	}
+
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if len(srv.got) != 1 || srv.got[0].GetId() != "g" {
+		t.Errorf("server received %v, want one metric g", srv.got)
+	}
+}
+
+// writeTestCert создаёт самоподписанный сертификат для 127.0.0.1/localhost
+// и возвращает пути к PEM-файлам сертификата и ключа.
+func writeTestCert(t *testing.T) (certFile, keyFile string) {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey() error = %v", err)
+	}
+
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "grpc test"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		DNSNames:              []string{"localhost"},
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("CreateCertificate() error = %v", err)
+	}
+
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatalf("MarshalPKCS8PrivateKey() error = %v", err)
+	}
+
+	dir := t.TempDir()
+	certFile = filepath.Join(dir, "cert.pem")
+	keyFile = filepath.Join(dir, "key.pem")
+	if err := os.WriteFile(certFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
+		t.Fatalf("WriteFile(cert) error = %v", err)
+	}
+	if err := os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}), 0o600); err != nil {
+		t.Fatalf("WriteFile(key) error = %v", err)
+	}
+	return certFile, keyFile
 }
 
 // TestNew_CloseNoop проверяет, что клиент на чужом соединении не закрывает его.

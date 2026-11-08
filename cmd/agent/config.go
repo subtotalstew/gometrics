@@ -17,6 +17,7 @@ type fileConfig struct {
 	Key            *string `json:"key"`
 	RateLimit      *int    `json:"rate_limit"`
 	GRPCAddress    *string `json:"grpc_address"`
+	GRPCTLSCA      *string `json:"grpc_tls_ca"`
 }
 
 // applyFileConfig накладывает значения из файла на cfg.
@@ -42,6 +43,7 @@ func applyFileConfig(cfg *config, path string, set func(name string) bool) error
 	if !set("g") && !set("grpc-address") && fc.GRPCAddress != nil {
 		cfg.grpcAddr = *fc.GRPCAddress
 	}
+	fileconfig.ApplyIf(&cfg.grpcTLSCA, fc.GRPCTLSCA, set, "grpc-tls-ca")
 
 	if err := fileconfig.ApplyValue(&cfg.reportInterval, fc.ReportInterval, set, "r", fileconfig.ParseSeconds); err != nil {
 		return err

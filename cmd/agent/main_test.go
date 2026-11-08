@@ -17,6 +17,7 @@ var envKeys = []string{
 	"CRYPTO_KEY",
 	"RATE_LIMIT",
 	"GRPC_ADDRESS",
+	"GRPC_TLS_CA",
 }
 
 // TestLoadConfig_Defaults проверяет значения по умолчанию, когда
@@ -56,6 +57,9 @@ func TestLoadConfig_Defaults(t *testing.T) {
 	if cfg.grpcAddr != "" {
 		t.Errorf("grpcAddr = %q, want empty (HTTP transport)", cfg.grpcAddr)
 	}
+	if cfg.grpcTLSCA != "" {
+		t.Errorf("grpcTLSCA = %q, want empty", cfg.grpcTLSCA)
+	}
 }
 
 // TestLoadConfig_FromEnv проверяет, что переменные окружения
@@ -90,6 +94,9 @@ func TestLoadConfig_FromEnv(t *testing.T) {
 	if err := os.Setenv("GRPC_ADDRESS", "localhost:9090"); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Setenv("GRPC_TLS_CA", "/tmp/ca.pem"); err != nil {
+		t.Fatal(err)
+	}
 
 	cfg, err := loadConfigFromArgs()
 	if err != nil {
@@ -115,6 +122,9 @@ func TestLoadConfig_FromEnv(t *testing.T) {
 	}
 	if cfg.grpcAddr != "localhost:9090" {
 		t.Errorf("grpcAddr = %q, want localhost:9090", cfg.grpcAddr)
+	}
+	if cfg.grpcTLSCA != "/tmp/ca.pem" {
+		t.Errorf("grpcTLSCA = %q, want /tmp/ca.pem", cfg.grpcTLSCA)
 	}
 }
 
@@ -225,7 +235,7 @@ func TestLoadConfigFrom_FlagsOverrideDefaults(t *testing.T) {
 
 	oldArgs := os.Args
 	os.Args = []string{"agent", "-a", "flagaddr:1234", "-p", "7", "-r", "21", "-k", "flagkey", "-l", "4",
-		"-crypto-key", "/tmp/flag-public.pem", "-grpc-address", "localhost:9090"}
+		"-crypto-key", "/tmp/flag-public.pem", "-grpc-address", "localhost:9090", "-grpc-tls-ca", "/tmp/flag-ca.pem"}
 	defer func() { os.Args = oldArgs }()
 
 	cfg, err := loadConfigFromArgs()
@@ -252,6 +262,9 @@ func TestLoadConfigFrom_FlagsOverrideDefaults(t *testing.T) {
 	}
 	if cfg.grpcAddr != "localhost:9090" {
 		t.Errorf("grpcAddr = %q, want localhost:9090", cfg.grpcAddr)
+	}
+	if cfg.grpcTLSCA != "/tmp/flag-ca.pem" {
+		t.Errorf("grpcTLSCA = %q, want /tmp/flag-ca.pem", cfg.grpcTLSCA)
 	}
 }
 
@@ -301,7 +314,8 @@ func TestLoadConfig_FileConfig(t *testing.T) {
 		"crypto_key": "/tmp/file.pem",
 		"key": "filekey",
 		"rate_limit": 5,
-		"grpc_address": "localhost:9095"
+		"grpc_address": "localhost:9095",
+		"grpc_tls_ca": "/tmp/file-ca.pem"
 	}`)
 
 	oldArgs := os.Args
@@ -332,6 +346,9 @@ func TestLoadConfig_FileConfig(t *testing.T) {
 	}
 	if cfg.grpcAddr != "localhost:9095" {
 		t.Errorf("grpcAddr = %q, want localhost:9095", cfg.grpcAddr)
+	}
+	if cfg.grpcTLSCA != "/tmp/file-ca.pem" {
+		t.Errorf("grpcTLSCA = %q, want /tmp/file-ca.pem", cfg.grpcTLSCA)
 	}
 }
 

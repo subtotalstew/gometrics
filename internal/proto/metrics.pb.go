@@ -10,7 +10,6 @@ import (
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	reflect "reflect"
-	sync "sync"
 	unsafe "unsafe"
 )
 
@@ -63,22 +62,15 @@ func (x Metric_MType) Number() protoreflect.EnumNumber {
 	return protoreflect.EnumNumber(x)
 }
 
-// Deprecated: Use Metric_MType.Descriptor instead.
-func (Metric_MType) EnumDescriptor() ([]byte, []int) {
-	return file_metrics_proto_rawDescGZIP(), []int{0, 0}
-}
-
 // Metric определяет единичную метрику.
 type Metric struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	Id    string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`                                // имя метрики
-	Type  Metric_MType           `protobuf:"varint,2,opt,name=type,proto3,enum=metrics.Metric_MType" json:"type,omitempty"` // тип метрики
-	// Поле delta для метрик-счётчиков.
-	Delta int64 `protobuf:"varint,3,opt,name=delta,proto3" json:"delta,omitempty"`
-	// Поле value для метрик-измерителей.
-	Value         float64 `protobuf:"fixed64,4,opt,name=value,proto3" json:"value,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state            protoimpl.MessageState `protogen:"opaque.v1"`
+	xxx_hidden_Id    string                 `protobuf:"bytes,1,opt,name=id,proto3"`
+	xxx_hidden_Type  Metric_MType           `protobuf:"varint,2,opt,name=type,proto3,enum=metrics.Metric_MType"`
+	xxx_hidden_Delta int64                  `protobuf:"varint,3,opt,name=delta,proto3"`
+	xxx_hidden_Value float64                `protobuf:"fixed64,4,opt,name=value,proto3"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *Metric) Reset() {
@@ -106,45 +98,78 @@ func (x *Metric) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use Metric.ProtoReflect.Descriptor instead.
-func (*Metric) Descriptor() ([]byte, []int) {
-	return file_metrics_proto_rawDescGZIP(), []int{0}
-}
-
 func (x *Metric) GetId() string {
 	if x != nil {
-		return x.Id
+		return x.xxx_hidden_Id
 	}
 	return ""
 }
 
 func (x *Metric) GetType() Metric_MType {
 	if x != nil {
-		return x.Type
+		return x.xxx_hidden_Type
 	}
 	return Metric_GAUGE
 }
 
 func (x *Metric) GetDelta() int64 {
 	if x != nil {
-		return x.Delta
+		return x.xxx_hidden_Delta
 	}
 	return 0
 }
 
 func (x *Metric) GetValue() float64 {
 	if x != nil {
-		return x.Value
+		return x.xxx_hidden_Value
 	}
 	return 0
 }
 
+func (x *Metric) SetId(v string) {
+	x.xxx_hidden_Id = v
+}
+
+func (x *Metric) SetType(v Metric_MType) {
+	x.xxx_hidden_Type = v
+}
+
+func (x *Metric) SetDelta(v int64) {
+	x.xxx_hidden_Delta = v
+}
+
+func (x *Metric) SetValue(v float64) {
+	x.xxx_hidden_Value = v
+}
+
+type Metric_builder struct {
+	_ [0]func() // Prevents comparability and use of unkeyed literals for the builder.
+
+	Id   string
+	Type Metric_MType
+	// Поле delta для метрик-счётчиков.
+	Delta int64
+	// Поле value для метрик-измерителей.
+	Value float64
+}
+
+func (b0 Metric_builder) Build() *Metric {
+	m0 := &Metric{}
+	b, x := &b0, m0
+	_, _ = b, x
+	x.xxx_hidden_Id = b.Id
+	x.xxx_hidden_Type = b.Type
+	x.xxx_hidden_Delta = b.Delta
+	x.xxx_hidden_Value = b.Value
+	return m0
+}
+
 // UpdateMetricsRequest содержит список метрик для обновления.
 type UpdateMetricsRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Metrics       []*Metric              `protobuf:"bytes,1,rep,name=metrics,proto3" json:"metrics,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state              protoimpl.MessageState `protogen:"opaque.v1"`
+	xxx_hidden_Metrics *[]*Metric             `protobuf:"bytes,1,rep,name=metrics,proto3"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *UpdateMetricsRequest) Reset() {
@@ -172,21 +197,36 @@ func (x *UpdateMetricsRequest) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use UpdateMetricsRequest.ProtoReflect.Descriptor instead.
-func (*UpdateMetricsRequest) Descriptor() ([]byte, []int) {
-	return file_metrics_proto_rawDescGZIP(), []int{1}
-}
-
 func (x *UpdateMetricsRequest) GetMetrics() []*Metric {
 	if x != nil {
-		return x.Metrics
+		if x.xxx_hidden_Metrics != nil {
+			return *x.xxx_hidden_Metrics
+		}
 	}
 	return nil
 }
 
+func (x *UpdateMetricsRequest) SetMetrics(v []*Metric) {
+	x.xxx_hidden_Metrics = &v
+}
+
+type UpdateMetricsRequest_builder struct {
+	_ [0]func() // Prevents comparability and use of unkeyed literals for the builder.
+
+	Metrics []*Metric
+}
+
+func (b0 UpdateMetricsRequest_builder) Build() *UpdateMetricsRequest {
+	m0 := &UpdateMetricsRequest{}
+	b, x := &b0, m0
+	_, _ = b, x
+	x.xxx_hidden_Metrics = &b.Metrics
+	return m0
+}
+
 // UpdateMetricsResponse — пустой ответ для подтверждения успешного обновления.
 type UpdateMetricsResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
+	state         protoimpl.MessageState `protogen:"opaque.v1"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -216,9 +256,16 @@ func (x *UpdateMetricsResponse) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use UpdateMetricsResponse.ProtoReflect.Descriptor instead.
-func (*UpdateMetricsResponse) Descriptor() ([]byte, []int) {
-	return file_metrics_proto_rawDescGZIP(), []int{2}
+type UpdateMetricsResponse_builder struct {
+	_ [0]func() // Prevents comparability and use of unkeyed literals for the builder.
+
+}
+
+func (b0 UpdateMetricsResponse_builder) Build() *UpdateMetricsResponse {
+	m0 := &UpdateMetricsResponse{}
+	b, x := &b0, m0
+	_, _ = b, x
+	return m0
 }
 
 var File_metrics_proto protoreflect.FileDescriptor
@@ -239,18 +286,6 @@ const file_metrics_proto_rawDesc = "" +
 	"\x15UpdateMetricsResponse2Y\n" +
 	"\aMetrics\x12N\n" +
 	"\rUpdateMetrics\x12\x1d.metrics.UpdateMetricsRequest\x1a\x1e.metrics.UpdateMetricsResponseB@Z>github.com/subtotalstew/gometrics.git/internal/proto;metricspbb\x06proto3"
-
-var (
-	file_metrics_proto_rawDescOnce sync.Once
-	file_metrics_proto_rawDescData []byte
-)
-
-func file_metrics_proto_rawDescGZIP() []byte {
-	file_metrics_proto_rawDescOnce.Do(func() {
-		file_metrics_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_metrics_proto_rawDesc), len(file_metrics_proto_rawDesc)))
-	})
-	return file_metrics_proto_rawDescData
-}
 
 var file_metrics_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
 var file_metrics_proto_msgTypes = make([]protoimpl.MessageInfo, 3)

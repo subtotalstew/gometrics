@@ -64,7 +64,7 @@ func (s *Server) UpdateMetrics(_ context.Context, req *pb.UpdateMetricsRequest) 
 		}
 	}
 
-	return &pb.UpdateMetricsResponse{}, nil
+	return pb.UpdateMetricsResponse_builder{}.Build(), nil
 }
 
 // fromProto переводит метрику из protobuf в модель приложения.
@@ -139,13 +139,19 @@ func checkRealIP(ctx context.Context, trusted *net.IPNet) error {
 // NewGRPCServer собирает gRPC-сервер с реализацией Metrics и интерсептором
 // проверки подсети. Возвращённый сервер остаётся за вызывающей стороной:
 // она вызывает Serve и останавливает его при завершении работы.
-func NewGRPCServer(st storage.Storage, syncSave func(), trustedSubnet string) (*grpc.Server, error) {
+//
+// opts позволяют вызвающей стороне добавить настройки транспорта — в
+// частности, TLS-credentials (grpc.Creds). Сервер не включает шифрование сам:
+// сертификаты читает cmd/server на старте, чтобы ошибка в путях была видна
+// сразу.
+func NewGRPCServer(st storage.Storage, syncSave func(), trustedSubnet string, opts ...grpc.ServerOption) (*grpc.Server, error) {
 	interceptor, err := TrustedSubnetInterceptor(trustedSubnet)
 	if err != nil {
 		return nil, err
 	}
 
-	gs := grpc.NewServer(grpc.UnaryInterceptor(interceptor))
+	opts = append(opts, grpc.UnaryInterceptor(interceptor))
+	gs := grpc.NewServer(opts...)
 	pb.RegisterMetricsServer(gs, New(st, syncSave))
 	return gs, nil
 }
