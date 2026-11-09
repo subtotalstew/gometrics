@@ -113,25 +113,29 @@ func TestPool_NewNil_GetReturnsNil(t *testing.T) {
 func TestPool_NewNil_PutThenGet(t *testing.T) {
 	t.Parallel()
 
-	// newFn == nil, но Put работает: объект попадает в пул и возвращается.
+	// newFn == nil, но Put работает: объект сбрасывается и попадает в пул.
 	p := New[*item](nil)
 
 	v := &item{value: 42, data: []int{1, 2, 3}}
 	p.Put(v)
 
-	got := p.Get()
-	if got == nil {
-		t.Fatal("Get() after Put with nil newFn returned nil")
+	// Reset вызывается синхронно в Put — это проверяется детерминированно.
+	if v.value != 0 {
+		t.Errorf("after Put: value = %d, want 0 (Reset should run)", v.value)
 	}
-	if got.value != 0 {
-		t.Errorf("after reuse: value = %d, want 0 (Reset should run)", got.value)
-	}
-	if len(got.data) != 0 {
-		t.Errorf("after reuse: data len = %d, want 0 (Reset should run)", len(got.data))
+	if len(v.data) != 0 {
+		t.Errorf("after Put: data len = %d, want 0 (Reset should run)", len(v.data))
 	}
 
-	// После того как пул опустел, снова Get → nil.
-	if extra := p.Get(); extra != nil {
-		t.Errorf("Get() on empty pool = %v, want nil", extra)
+	// sync.Pool может удалить объект в любой момент (например, при GC),
+	// поэтому Get не обязан вернуть именно v. Если объект всё же вернулся,
+	// он должен быть сброшен.
+	if got := p.Get(); got != nil {
+		if got.value != 0 {
+			t.Errorf("after reuse: value = %d, want 0 (Reset should run)", got.value)
+		}
+		if len(got.data) != 0 {
+			t.Errorf("after reuse: data len = %d, want 0 (Reset should run)", len(got.data))
+		}
 	}
 }
