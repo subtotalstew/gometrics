@@ -1,6 +1,9 @@
 // Package agent собирает метрики рантайма и системы (gopsutil) и отправляет
-// их на сервер метрик батчами через POST /updates/ (gzip + подпись HMAC,
-// опционально асимметричное шифрование тела запроса).
+// их на сервер метрик батчами: по HTTP через POST /updates/ (gzip + подпись
+// HMAC, опционально асимметричное шифрование тела запроса) или по gRPC
+// (Metrics.UpdateMetrics), если задан адрес gRPC-сервера. IP-адрес агента
+// передаётся в заголовке X-Real-IP или метаданных x-real-ip — по нему сервер
+// проверяет, что агент входит в доверенную подсеть (trusted_subnet).
 package agent
 
 import (
@@ -12,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -26,6 +30,7 @@ import (
 	"github.com/shirou/gopsutil/v3/mem"
 
 	"github.com/subtotalstew/gometrics.git/internal/crypto"
+	"github.com/subtotalstew/gometrics.git/internal/grpcagent"
 	"github.com/subtotalstew/gometrics.git/internal/hash"
 	"github.com/subtotalstew/gometrics.git/internal/models"
 	"github.com/subtotalstew/gometrics.git/internal/retry"
@@ -50,6 +55,69 @@ func compressGzip(dst *bytes.Buffer, data []byte) error {
 		return err
 	}
 	return gz.Close()
+}
+
+// HeaderRealIP — заголовок, в котором агент сообщает серверу свой IP-адрес.
+// Сервер сверяет его с доверенной подсетью (trusted_subnet).
+const HeaderRealIP = "X-Real-IP"
+
+// HostIP возвращает IPv4-адрес хоста агента для заголовка X-Real-IP.
+//
+// Сначала берётся адрес, с которого ОС реально отправляет пакеты наружу
+// (UDP-соединение не шлёт данных, поэтому вызов дешёвый и не требует
+// доступности адреса). Если маршрута нет — первый не-loopback IPv4 из
+// поднятых интерфейсов. Если внешних адресов нет вовсе, возвращается
+// 127.0.0.1: сервер с подсетью 127.0.0.0/8 пустит такой запрос.
+func HostIP() string {
+	if conn, err := net.Dial("udp4", "8.8.8.8:80"); err == nil {
+		addr := conn.LocalAddr()
+		_ = conn.Close()
+		if udp, ok := addr.(*net.UDPAddr); ok && udp.IP != nil {
+			if ip4 := udp.IP.To4(); ip4 != nil {
+				return ip4.String()
+			}
+		}
+	}
+
+	ifaces, err := net.Interfaces()
+	if err == nil {
+		for _, iface := range ifaces {
+			if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+				continue
+			}
+			addrs, err := iface.Addrs()
+			if err != nil {
+				continue
+			}
+			for _, a := range addrs {
+				var ip net.IP
+				switch v := a.(type) {
+				case *net.IPNet:
+					ip = v.IP
+				case *net.IPAddr:
+					ip = v.IP
+				}
+				if ip == nil || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+					continue
+				}
+				if ip4 := ip.To4(); ip4 != nil {
+					return ip4.String()
+				}
+			}
+		}
+	}
+
+	return "127.0.0.1"
+}
+
+// realIP возвращает адрес хоста агента для заголовка X-Real-IP (HTTP)
+// и метаданных x-real-ip (gRPC). Если адрес не был определён при создании
+// (агент собран не через NewAgent), он вычисляется при первом запросе.
+func (a *Agent) realIP() string {
+	if a.hostIP != "" {
+		return a.hostIP
+	}
+	return HostIP()
 }
 
 // Collector накапливает метрики в памяти: gauge — текущие значения
@@ -165,7 +233,6 @@ func (c *Collector) GetCounter() map[string]int64 {
 // Agent собирает метрики по расписанию и отправляет их на сервер метрик
 // пулом воркеров. Один Agent соответствует одному запущенному процессу агента.
 type Agent struct {
-	mu             sync.RWMutex
 	collector      *Collector
 	serverAddr     string
 	pollInterval   int
@@ -173,7 +240,11 @@ type Agent struct {
 	rateLimit      int
 	key            string
 	pubKey         *rsa.PublicKey
+	hostIP         string
 	client         *http.Client
+
+	// grpc != nil — метрики отправляются по gRPC (см. SetGRPC).
+	grpc *grpcagent.Client
 
 	// dirty — были ли измерения после последнего снимка, поставленного
 	// в очередь отправки. Нужен, чтобы при остановке не отправлять
@@ -195,20 +266,24 @@ type Agent struct {
 // с схемой, например http://localhost:8080.
 // Пустой key отключает подпись HashSHA256; rateLimit <= 0 трактуется как 1.
 //
+// Адрес хоста для заголовка X-Real-IP определяется один раз при создании
+// агента (HostIP): он не меняется, а запросов много.
+//
 // Асимметричное шифрование включается отдельно методом SetCryptoKey.
 func NewAgent(serverAddr string, pollInterval, reportInterval, rateLimit int, key string) *Agent {
 	if rateLimit <= 0 {
 		rateLimit = 1
 	}
 	return &Agent{
-		collector:      NewCollector(),
-		serverAddr:     serverAddr,
-		pollInterval:   pollInterval,
-		reportInterval: reportInterval,
-		rateLimit:      rateLimit,
-		key:            key,
-		client:         &http.Client{Timeout: 5 * time.Second},
-		flushTimeout:   defaultFlushTimeout,
+		collector:       NewCollector(),
+		serverAddr:      serverAddr,
+		pollInterval:    pollInterval,
+		reportInterval:  reportInterval,
+		rateLimit:       rateLimit,
+		key:             key,
+		hostIP:          HostIP(),
+		client:          &http.Client{Timeout: 5 * time.Second},
+		flushTimeout:    defaultFlushTimeout,
 		shutdownTimeout: defaultShutdownTimeout,
 	}
 }
@@ -502,6 +577,17 @@ func (a *Agent) worker(ctx context.Context, id int, jobs <-chan []models.Metrics
 }
 
 func (a *Agent) sendMetricsBatch(ctx context.Context, metrics []models.Metrics) {
+	// Если настроен gRPC-транспорт, JSON/gzip/подпись не нужны: батч уходит
+	// protobuf-сообщением, а IP агента — в метаданных.
+	if a.grpc != nil {
+		if err := a.grpc.SendMetrics(ctx, a.realIP(), metrics); err != nil {
+			log.Error().Err(err).Int("count", len(metrics)).Msg("failed to send metrics batch via gRPC after retries")
+			return
+		}
+		log.Info().Int("count", len(metrics)).Msg("metrics batch sent successfully via gRPC")
+		return
+	}
+
 	body, err := json.Marshal(metrics)
 	if err != nil {
 		log.Error().Err(err).Int("count", len(metrics)).Msg("failed to marshal metrics batch")
@@ -585,6 +671,9 @@ func (a *Agent) newRequest(ctx context.Context, url string, payload []byte, head
 	}
 
 	req.Header = headers.Clone()
+	// X-Real-IP нужен серверу, чтобы сверить агента с доверенной подсетью.
+	// Запросы к серверу без trusted_subnet этот заголовок просто игнорируют.
+	req.Header.Set(HeaderRealIP, a.realIP())
 	if a.key != "" {
 		req.Header.Set("HashSHA256", hash.Compute(payload, a.key))
 	}

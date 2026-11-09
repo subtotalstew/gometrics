@@ -1,4 +1,5 @@
-// Command server запускает HTTP-сервер метрик.
+// Command server запускает HTTP-сервер метрик и, если задан -g/GRPC_ADDRESS,
+// gRPC-сервер с тем же хранилищем.
 //
 // main не вызывает os.Exit напрямую (это запрещено анализатором noosexit);
 // вся работа делегируется run(), а ошибка логируется через log.Print.
@@ -11,6 +12,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -22,9 +24,12 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	_ "github.com/lib/pq"
 	"github.com/rs/zerolog/log"
+	"google.golang.org/grpc"
 
 	"github.com/subtotalstew/gometrics.git/internal/audit"
 	fileconfig "github.com/subtotalstew/gometrics.git/internal/config"
+	"github.com/subtotalstew/gometrics.git/internal/grpcserver"
+	"github.com/subtotalstew/gometrics.git/internal/grpctls"
 	"github.com/subtotalstew/gometrics.git/internal/handler"
 	"github.com/subtotalstew/gometrics.git/internal/profiler"
 	"github.com/subtotalstew/gometrics.git/internal/storage"
@@ -54,6 +59,10 @@ type config struct {
 	auditFile     string
 	auditURL      string
 	pprofAddr     string
+	trustedSubnet string
+	grpcAddr      string
+	grpcTLSCert   string
+	grpcTLSKey    string
 }
 
 func main() {
@@ -110,6 +119,11 @@ func loadConfigFrom(fs *flag.FlagSet) (config, error) {
 	fs.StringVar(&cfg.auditFile, "audit-file", "", "path to audit log file")
 	fs.StringVar(&cfg.auditURL, "audit-url", "", "URL for audit log delivery")
 	fs.StringVar(&cfg.pprofAddr, "pprof-addr", "", "address of the pprof/debug HTTP server (empty = disabled)")
+	fs.StringVar(&cfg.trustedSubnet, "t", "", "trusted subnet in CIDR notation; metrics from other IPs are rejected with 403 (empty = no restriction)")
+	fs.StringVar(&cfg.grpcAddr, "g", "", "address and port to run the gRPC server (empty = disabled)")
+	fs.StringVar(&cfg.grpcAddr, "grpc-address", "", "address and port to run the gRPC server (alias for -g)")
+	fs.StringVar(&cfg.grpcTLSCert, "grpc-tls-cert", "", "path to PEM certificate (or certificate chain) for the gRPC server")
+	fs.StringVar(&cfg.grpcTLSKey, "grpc-tls-key", "", "path to PEM private key for the gRPC server")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		return config{}, err
@@ -163,6 +177,18 @@ func loadConfigFrom(fs *flag.FlagSet) (config, error) {
 	if v := os.Getenv("PPROF_ADDR"); v != "" {
 		cfg.pprofAddr = v
 	}
+	if v := os.Getenv("TRUSTED_SUBNET"); v != "" {
+		cfg.trustedSubnet = v
+	}
+	if v := os.Getenv("GRPC_ADDRESS"); v != "" {
+		cfg.grpcAddr = v
+	}
+	if v := os.Getenv("GRPC_TLS_CERT"); v != "" {
+		cfg.grpcTLSCert = v
+	}
+	if v := os.Getenv("GRPC_TLS_KEY"); v != "" {
+		cfg.grpcTLSKey = v
+	}
 	return cfg, nil
 }
 
@@ -173,6 +199,10 @@ func loadConfigFrom(fs *flag.FlagSet) (config, error) {
 // (по шифртексту), затем тело расшифровывается приватным ключом, и только
 // после этого распаковывается gzip. Ключ расшифрования задаётся в serve через
 // handler.SetCryptoKey; без ключа DecryptMiddleware ничего не делает.
+//
+// Запись метрик дополнительно защищена проверкой X-Real-IP: если сервер
+// запущен с trusted_subnet, запросы на /update*, /updates* из чужих адресов
+// получают 403. Чтение метрик (/, /value, /ping) не ограничивается.
 func buildRouter(h *handler.Handler, key string) *chi.Mux {
 	r := chi.NewRouter()
 
@@ -185,18 +215,30 @@ func buildRouter(h *handler.Handler, key string) *chi.Mux {
 	r.Use(h.LoggingMiddleware)
 	r.Use(middleware.Recoverer)
 
-	r.Post("/update", h.UpdateJSONHandler)
+	// Запись метрик — в отдельной группе, потому что только эти маршруты
+	// проверяют доверенную подсеть. Middleware подключается, только если
+	// подсеть действительно задана: при пустом trusted_subnet в цепочке
+	// не должно быть лишнего звена.
+	r.Group(func(r chi.Router) {
+		if h.HasTrustedSubnet() {
+			r.Use(h.TrustedSubnetMiddleware)
+		}
+
+		r.Post("/update", h.UpdateJSONHandler)
+		r.Post("/update/", h.UpdateJSONHandler)
+
+		r.Post("/update/{type}/{name}/{value}", h.UpdateHandler)
+
+		r.Post("/updates", h.UpdatesJSONHandler)
+		r.Post("/updates/", h.UpdatesJSONHandler)
+	})
+
 	r.Post("/value", h.ValueJSONHandler)
-	r.Post("/update/", h.UpdateJSONHandler)
 	r.Post("/value/", h.ValueJSONHandler)
 
-	r.Post("/update/{type}/{name}/{value}", h.UpdateHandler)
 	r.Get("/value/{type}/{name}", h.ValueHandler)
 	r.Get("/", h.RootHandler)
 	r.Get("/ping", h.PingHandler)
-
-	r.Post("/updates", h.UpdatesJSONHandler)
-	r.Post("/updates/", h.UpdatesJSONHandler)
 
 	return r
 }
@@ -250,6 +292,15 @@ func serve(cfg config) error {
 
 	h := handler.NewHandler(metricsStorage)
 
+	// Доверенная подсеть разбирается на старте: битый CIDR в конфигурации
+	// должен останавливать сервер, а не отключать проверку незаметно.
+	if err := h.SetTrustedSubnet(cfg.trustedSubnet); err != nil {
+		return err
+	}
+	if cfg.trustedSubnet != "" {
+		log.Info().Str("subnet", cfg.trustedSubnet).Msg("проверка X-Real-IP: включена")
+	}
+
 	// Приватный ключ читается на старте: опечатка в пути или битый файл
 	// должны останавливать сервер сразу, а не ломать каждый батч агента.
 	if cfg.cryptoKey != "" {
@@ -285,6 +336,9 @@ func serve(cfg config) error {
 
 	var stop, done chan struct{}
 
+	// syncSave — общий колбэк синхронного сохранения для HTTP- и gRPC-пути.
+	var syncSave func()
+
 	// stopPeriodic останавливает фоновое сохранение и ждёт, пока текущая
 	// запись на диск закончится. Повторный вызов ничего не делает.
 	stopPeriodic := func() {
@@ -300,11 +354,12 @@ func serve(cfg config) error {
 	if cfg.databaseDSN == "" && cfg.filePath != "" {
 		if memStorage, ok := metricsStorage.(*storage.MemStorage); ok {
 			if cfg.storeInterval == 0 {
-				h.SetSyncSave(func() {
+				syncSave = func() {
 					if err := storage.SaveToFile(memStorage, cfg.filePath); err != nil {
 						log.Error().Err(err).Msg("не удалось синхронно сохранить метрики")
 					}
-				})
+				}
+				h.SetSyncSave(syncSave)
 			} else {
 				stop = make(chan struct{})
 				done = make(chan struct{})
@@ -318,6 +373,45 @@ func serve(cfg config) error {
 
 	r := buildRouter(h, cfg.key)
 	srv := &http.Server{Addr: cfg.addr, Handler: r}
+
+	// gRPC-сервер работает параллельно с HTTP и использует то же хранилище.
+	// Подсеть та же: интерсептор проверяет x-real-ip из метаданных запроса.
+	var grpcSrv *grpc.Server
+	grpcErr := make(chan error, 1)
+
+	if cfg.grpcAddr != "" {
+		// gRPC работает только по TLS. Если сертификат и ключ не заданы,
+		// генерируется самоподписанный — этого достаточно для учебного
+		// запуска; для проверки сервера агенту нужен CA (или он работает
+		// без проверки сертификата).
+		tlsCreds, generated, err := grpctls.ServerCredentials(cfg.grpcTLSCert, cfg.grpcTLSKey)
+		if err != nil {
+			return fmt.Errorf("не удалось настроить TLS gRPC: %w", err)
+		}
+		if generated {
+			log.Warn().Msg("gRPC: файлы сертификата не заданы, сгенерирован самоподписанный TLS-сертификат")
+		}
+
+		gs, err := grpcserver.NewGRPCServer(metricsStorage, syncSave, cfg.trustedSubnet, grpc.Creds(tlsCreds))
+		if err != nil {
+			return err
+		}
+
+		lis, err := net.Listen("tcp", cfg.grpcAddr)
+		if err != nil {
+			return fmt.Errorf("не удалось запустить gRPC-сервер: %w", err)
+		}
+
+		grpcSrv = gs
+		defer func() { grpcSrv.Stop() }()
+		log.Info().Str("addr", lis.Addr().String()).Msg("gRPC-сервер запущен")
+
+		go func() {
+			if err := gs.Serve(lis); err != nil {
+				grpcErr <- err
+			}
+		}()
+	}
 
 	// Ошибка запуска (например, занятый порт) не должна оставлять процесс
 	// висеть в ожидании сигнала.
@@ -340,6 +434,9 @@ func serve(cfg config) error {
 	case err := <-srvErr:
 		signal.Stop(sigChan)
 		return fmt.Errorf("HTTP-сервер не смог запуститься: %w", err)
+	case err := <-grpcErr:
+		signal.Stop(sigChan)
+		return fmt.Errorf("gRPC-сервер не смог запуститься: %w", err)
 	}
 
 	// 1. Перестаём принимать новые запросы и дожидаемся уже начатых:
@@ -350,6 +447,21 @@ func serve(cfg config) error {
 	if err := srv.Shutdown(ctx); err != nil {
 		log.Error().Err(err).Msg("не удалось дождаться активных запросов, закрываем соединения принудительно")
 		_ = srv.Close()
+	}
+
+	// gRPC останавливаем мягко: GracefulStop ждёт завершения уже принятых
+	// вызовов, но не дольше общего таймаута остановки.
+	if grpcSrv != nil {
+		stopped := make(chan struct{})
+		go func() {
+			grpcSrv.GracefulStop()
+			close(stopped)
+		}()
+		select {
+		case <-stopped:
+		case <-ctx.Done():
+			grpcSrv.Stop()
+		}
 	}
 
 	// 2. Останавливаем фоновое сохранение: дальше файл пишем только мы.

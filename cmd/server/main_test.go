@@ -15,6 +15,7 @@ import (
 var envKeys = []string{
 	"CONFIG", "ADDRESS", "STORE_INTERVAL", "FILE_STORAGE_PATH", "RESTORE",
 	"DATABASE_DSN", "KEY", "CRYPTO_KEY", "AUDIT_FILE", "AUDIT_URL", "PPROF_ADDR",
+	"TRUSTED_SUBNET", "GRPC_ADDRESS", "GRPC_TLS_CERT", "GRPC_TLS_KEY",
 }
 
 // --- config ---
@@ -50,6 +51,15 @@ func TestLoadConfigFrom_Defaults(t *testing.T) {
 	if cfg.cryptoKey != "" {
 		t.Errorf("cryptoKey = %q, want empty", cfg.cryptoKey)
 	}
+	if cfg.trustedSubnet != "" {
+		t.Errorf("trustedSubnet = %q, want empty", cfg.trustedSubnet)
+	}
+	if cfg.grpcAddr != "" {
+		t.Errorf("grpcAddr = %q, want empty (gRPC disabled)", cfg.grpcAddr)
+	}
+	if cfg.grpcTLSCert != "" || cfg.grpcTLSKey != "" {
+		t.Errorf("grpc TLS = %q, %q; want empty", cfg.grpcTLSCert, cfg.grpcTLSKey)
+	}
 }
 
 func TestLoadConfigFrom_EnvOverridesFlags(t *testing.T) {
@@ -71,6 +81,10 @@ func TestLoadConfigFrom_EnvOverridesFlags(t *testing.T) {
 	_ = os.Setenv("AUDIT_FILE", "/tmp/audit.log")
 	_ = os.Setenv("AUDIT_URL", "http://audit.example")
 	_ = os.Setenv("PPROF_ADDR", "localhost:6060")
+	_ = os.Setenv("TRUSTED_SUBNET", "192.168.0.0/16")
+	_ = os.Setenv("GRPC_ADDRESS", "localhost:9090")
+	_ = os.Setenv("GRPC_TLS_CERT", "/tmp/grpc.crt")
+	_ = os.Setenv("GRPC_TLS_KEY", "/tmp/grpc.key")
 
 	cfg, err := loadConfigFromArgs()
 	if err != nil {
@@ -105,6 +119,15 @@ func TestLoadConfigFrom_EnvOverridesFlags(t *testing.T) {
 	}
 	if cfg.pprofAddr != "localhost:6060" {
 		t.Errorf("pprofAddr = %q", cfg.pprofAddr)
+	}
+	if cfg.trustedSubnet != "192.168.0.0/16" {
+		t.Errorf("trustedSubnet = %q, want 192.168.0.0/16", cfg.trustedSubnet)
+	}
+	if cfg.grpcAddr != "localhost:9090" {
+		t.Errorf("grpcAddr = %q, want localhost:9090", cfg.grpcAddr)
+	}
+	if cfg.grpcTLSCert != "/tmp/grpc.crt" || cfg.grpcTLSKey != "/tmp/grpc.key" {
+		t.Errorf("grpc TLS = %q, %q", cfg.grpcTLSCert, cfg.grpcTLSKey)
 	}
 }
 
@@ -181,6 +204,58 @@ func TestLoadConfigFrom_CryptoKeyFlag(t *testing.T) {
 	}
 }
 
+// TestLoadConfigFrom_TrustedSubnetFlag проверяет флаг -t: строка CIDR
+// доверенной подсети, из которой агенту разрешено присылать метрики.
+func TestLoadConfigFrom_TrustedSubnetFlag(t *testing.T) {
+	saved := saveEnv()
+	defer restoreEnv(saved)
+	clearEnv()
+
+	oldArgs := os.Args
+	os.Args = []string{"server", "-t", "10.0.0.0/8"}
+	defer func() { os.Args = oldArgs }()
+
+	cfg, err := loadConfigFromArgs()
+	if err != nil {
+		t.Fatalf("loadConfigFromArgs() error = %v", err)
+	}
+	if cfg.trustedSubnet != "10.0.0.0/8" {
+		t.Errorf("trustedSubnet = %q, want 10.0.0.0/8", cfg.trustedSubnet)
+	}
+}
+
+// TestLoadConfigFrom_GRPCAddressFlag проверяет флаг -g (и его алиас
+// -grpc-address): адрес, на котором сервер поднимает gRPC.
+func TestLoadConfigFrom_GRPCAddressFlag(t *testing.T) {
+	saved := saveEnv()
+	defer restoreEnv(saved)
+	clearEnv()
+
+	oldArgs := os.Args
+	defer func() { os.Args = oldArgs }()
+
+	os.Args = []string{"server", "-g", "localhost:9090", "-grpc-tls-cert", "/tmp/cert.pem", "-grpc-tls-key", "/tmp/key.pem"}
+	cfg, err := loadConfigFromArgs()
+	if err != nil {
+		t.Fatalf("loadConfigFromArgs() error = %v", err)
+	}
+	if cfg.grpcAddr != "localhost:9090" {
+		t.Errorf("grpcAddr = %q, want localhost:9090", cfg.grpcAddr)
+	}
+	if cfg.grpcTLSCert != "/tmp/cert.pem" || cfg.grpcTLSKey != "/tmp/key.pem" {
+		t.Errorf("grpc TLS = %q, %q; want /tmp/cert.pem, /tmp/key.pem", cfg.grpcTLSCert, cfg.grpcTLSKey)
+	}
+
+	os.Args = []string{"server", "-grpc-address", "localhost:9091"}
+	cfg, err = loadConfigFromArgs()
+	if err != nil {
+		t.Fatalf("loadConfigFromArgs() error = %v", err)
+	}
+	if cfg.grpcAddr != "localhost:9091" {
+		t.Errorf("grpcAddr = %q, want localhost:9091", cfg.grpcAddr)
+	}
+}
+
 // --- файл конфигурации ---
 
 // TestLoadConfigFrom_FileConfig проверяет, что все опции сервера
@@ -200,7 +275,11 @@ func TestLoadConfigFrom_FileConfig(t *testing.T) {
 		"key": "filekey",
 		"audit_file": "/tmp/file-audit.log",
 		"audit_url": "http://file-audit",
-		"pprof_addr": "localhost:7070"
+		"pprof_addr": "localhost:7070",
+		"trusted_subnet": "172.16.0.0/12",
+		"grpc_address": "localhost:9092",
+		"grpc_tls_cert": "/tmp/file-grpc.crt",
+		"grpc_tls_key": "/tmp/file-grpc.key"
 	}`)
 
 	oldArgs := os.Args
@@ -240,6 +319,15 @@ func TestLoadConfigFrom_FileConfig(t *testing.T) {
 	}
 	if cfg.pprofAddr != "localhost:7070" {
 		t.Errorf("pprofAddr = %q", cfg.pprofAddr)
+	}
+	if cfg.trustedSubnet != "172.16.0.0/12" {
+		t.Errorf("trustedSubnet = %q, want 172.16.0.0/12", cfg.trustedSubnet)
+	}
+	if cfg.grpcAddr != "localhost:9092" {
+		t.Errorf("grpcAddr = %q, want localhost:9092", cfg.grpcAddr)
+	}
+	if cfg.grpcTLSCert != "/tmp/file-grpc.crt" || cfg.grpcTLSKey != "/tmp/file-grpc.key" {
+		t.Errorf("grpc TLS = %q, %q", cfg.grpcTLSCert, cfg.grpcTLSKey)
 	}
 }
 
@@ -433,6 +521,92 @@ func TestRouter_UpdatesBatch(t *testing.T) {
 	}
 	if _, ok := mem.GetCounter("c1"); !ok {
 		t.Error("c1 not saved via batch")
+	}
+}
+
+// --- доверенная подсеть ---
+
+// TestRouter_TrustedSubnet проверяет, что при заданной доверенной подсети
+// метрики принимаются только от агентов из неё, а чтение метрик не
+// ограничивается.
+func TestRouter_TrustedSubnet(t *testing.T) {
+	t.Parallel()
+
+	mem := storage.NewMemStorage()
+	h := handler.NewHandler(mem)
+	if err := h.SetTrustedSubnet("192.168.0.0/16"); err != nil {
+		t.Fatalf("SetTrustedSubnet() error = %v", err)
+	}
+	r := buildRouter(h, "")
+
+	batch := `[{"id":"g1","type":"gauge","value":1.5}]`
+
+	tests := []struct {
+		name       string
+		method     string
+		path       string
+		body       string
+		realIP     string
+		wantStatus int
+	}{
+		{name: "batch from trusted IP", method: http.MethodPost, path: "/updates/", body: batch, realIP: "192.168.1.5", wantStatus: http.StatusOK},
+		{name: "batch from foreign IP", method: http.MethodPost, path: "/updates/", body: batch, realIP: "10.0.0.1", wantStatus: http.StatusForbidden},
+		{name: "batch without header", method: http.MethodPost, path: "/updates/", body: batch, wantStatus: http.StatusForbidden},
+		{name: "update from foreign IP", method: http.MethodPost, path: "/update", body: `{"id":"g2","type":"gauge","value":1}`, realIP: "10.0.0.1", wantStatus: http.StatusForbidden},
+		{name: "path update from trusted IP", method: http.MethodPost, path: "/update/gauge/g3/1", realIP: "192.168.0.7", wantStatus: http.StatusOK},
+		{name: "root page is not restricted", method: http.MethodGet, path: "/", wantStatus: http.StatusOK},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var body *strings.Reader
+			if tt.body != "" {
+				body = strings.NewReader(tt.body)
+			} else {
+				body = strings.NewReader("")
+			}
+			req := httptest.NewRequest(tt.method, tt.path, body)
+			req.Header.Set("Content-Type", "application/json")
+			if tt.realIP != "" {
+				req.Header.Set("X-Real-IP", tt.realIP)
+			}
+			w := httptest.NewRecorder()
+
+			r.ServeHTTP(w, req)
+
+			if w.Code != tt.wantStatus {
+				t.Errorf("%s %s with X-Real-IP=%q -> %d, want %d", tt.method, tt.path, tt.realIP, w.Code, tt.wantStatus)
+			}
+		})
+	}
+
+	// Метрика из доверенного запроса действительно сохранилась.
+	if _, ok := mem.GetGauge("g3"); !ok {
+		t.Error("g3 not saved by trusted request")
+	}
+	if _, ok := mem.GetGauge("g1"); !ok {
+		t.Error("g1 from trusted batch not saved")
+	}
+}
+
+// TestRouter_EmptyTrustedSubnet проверяет, что при пустом trusted_subnet
+// метрики обрабатываются без ограничений.
+func TestRouter_EmptyTrustedSubnet(t *testing.T) {
+	t.Parallel()
+
+	mem := storage.NewMemStorage()
+	h := handler.NewHandler(mem)
+	r := buildRouter(h, "")
+
+	req := httptest.NewRequest(http.MethodPost, "/updates/", strings.NewReader(`[{"id":"g1","type":"gauge","value":1}]`))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("updates without trusted subnet -> %d, want 200", w.Code)
+	}
+	if _, ok := mem.GetGauge("g1"); !ok {
+		t.Error("g1 not saved")
 	}
 }
 

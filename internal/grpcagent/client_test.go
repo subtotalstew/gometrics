@@ -1,0 +1,375 @@
+package grpcagent
+
+import (
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"errors"
+	"math/big"
+	"net"
+	"os"
+	"path/filepath"
+	"sync"
+	"testing"
+	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
+	"google.golang.org/grpc/test/bufconn"
+
+	"github.com/subtotalstew/gometrics.git/internal/grpctls"
+	"github.com/subtotalstew/gometrics.git/internal/models"
+	pb "github.com/subtotalstew/gometrics.git/internal/proto"
+)
+
+// captureServer запоминает последний запрос и метаданные.
+type captureServer struct {
+	pb.UnimplementedMetricsServer
+
+	mu   sync.Mutex
+	got  []*pb.Metric
+	meta metadata.MD
+}
+
+func (s *captureServer) UpdateMetrics(ctx context.Context, req *pb.UpdateMetricsRequest) (*pb.UpdateMetricsResponse, error) {
+	md, _ := metadata.FromIncomingContext(ctx)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.meta = md
+	s.got = req.GetMetrics()
+
+	return pb.UpdateMetricsResponse_builder{}.Build(), nil
+}
+
+// dialTestServer поднимает gRPC-сервер на bufconn и возвращает соединение.
+func dialTestServer(t *testing.T, srv pb.MetricsServer, opts ...grpc.ServerOption) *grpc.ClientConn {
+	t.Helper()
+
+	lis := bufconn.Listen(1024 * 1024)
+	gs := grpc.NewServer(opts...)
+	pb.RegisterMetricsServer(gs, srv)
+	go func() {
+		_ = gs.Serve(lis)
+	}()
+
+	conn, err := grpc.NewClient("passthrough:///bufnet",
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return lis.Dial() }),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("grpc.NewClient() error = %v", err)
+	}
+
+	t.Cleanup(func() {
+		_ = conn.Close()
+		gs.Stop()
+		_ = lis.Close()
+	})
+	return conn
+}
+
+// TestSendMetrics проверяет отправку батча и метаданные x-real-ip.
+func TestSendMetrics(t *testing.T) {
+	srv := &captureServer{}
+	c := New(dialTestServer(t, srv))
+
+	value := 1.5
+	delta := int64(3)
+	err := c.SendMetrics(context.Background(), "10.9.8.7", []models.Metrics{
+		{ID: "g", MType: models.Gauge, Value: &value},
+		{ID: "c", MType: models.Counter, Delta: &delta},
+	})
+	if err != nil {
+		t.Fatalf("SendMetrics() error = %v", err)
+	}
+
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+
+	if len(srv.got) != 2 {
+		t.Fatalf("received %d metrics, want 2", len(srv.got))
+	}
+	if srv.got[0].GetId() != "g" || srv.got[0].GetValue() != value {
+		t.Errorf("gauge = %v, want id=g value=%v", srv.got[0], value)
+	}
+	if srv.got[1].GetId() != "c" || srv.got[1].GetDelta() != delta {
+		t.Errorf("counter = %v, want id=c delta=%d", srv.got[1], delta)
+	}
+	if got := srv.meta.Get(MetadataRealIP); len(got) != 1 || got[0] != "10.9.8.7" {
+		t.Errorf("metadata %s = %v, want [10.9.8.7]", MetadataRealIP, got)
+	}
+}
+
+// TestSendMetrics_NonRetriableError проверяет, что отказ сервера возвращается
+// как ошибка и не повторяется (иначе вызов завис бы на ретраях).
+func TestSendMetrics_NonRetriableError(t *testing.T) {
+	conn := dialTestServer(t, &captureServer{}, grpc.UnaryInterceptor(
+		func(context.Context, any, *grpc.UnaryServerInfo, grpc.UnaryHandler) (any, error) {
+			return nil, status.Error(codes.PermissionDenied, "forbidden")
+		},
+	))
+
+	c := New(conn)
+	value := 1.0
+	err := c.SendMetrics(context.Background(), "10.0.0.1", []models.Metrics{
+		{ID: "g", MType: models.Gauge, Value: &value},
+	})
+
+	if status.Code(err) != codes.PermissionDenied {
+		t.Errorf("code = %v, want PermissionDenied (err = %v)", status.Code(err), err)
+	}
+}
+
+// TestDial проверяет создание клиента по адресу: без CA используется fallback
+// (TLS без проверки сервера), с CA — обычная проверка.
+func TestDial(t *testing.T) {
+	empty, err := Dial("", "")
+	if err != nil || empty != nil {
+		t.Fatalf("Dial(\"\") = %v, %v; want nil, nil", empty, err)
+	}
+
+	if _, err := Dial("localhost:18080", filepath.Join(t.TempDir(), "missing.pem")); err == nil {
+		t.Fatal("Dial() with missing CA file = nil, want error")
+	}
+
+	noCA, err := Dial("localhost:18080", "")
+	if err != nil {
+		t.Fatalf("Dial() without CA error = %v", err)
+	}
+	if noCA == nil || noCA.conn == nil {
+		t.Fatal("Dial() without CA did not create connection")
+	}
+	if err := noCA.Close(); err != nil {
+		t.Errorf("Close() error = %v", err)
+	}
+
+	certFile, _ := writeTestCert(t)
+	c, err := Dial("localhost:18080", certFile)
+	if err != nil {
+		t.Fatalf("Dial() error = %v", err)
+	}
+	if c == nil || c.conn == nil {
+		t.Fatal("Dial() did not create connection")
+	}
+	if err := c.Close(); err != nil {
+		t.Errorf("Close() error = %v", err)
+	}
+	if err := c.Close(); err != nil {
+		t.Errorf("second Close() error = %v", err)
+	}
+}
+
+// TestDial_TLS проверяет реальное TLS-соединение: сервер с самоподписанным
+// сертификатом, клиент — с этим сертификатом как CA.
+func TestDial_TLS(t *testing.T) {
+	certFile, keyFile := writeTestCert(t)
+
+	creds, err := credentials.NewServerTLSFromFile(certFile, keyFile)
+	if err != nil {
+		t.Fatalf("NewServerTLSFromFile() error = %v", err)
+	}
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+
+	srv := &captureServer{}
+	gs := grpc.NewServer(grpc.Creds(creds))
+	pb.RegisterMetricsServer(gs, srv)
+	go func() {
+		_ = gs.Serve(lis)
+	}()
+	t.Cleanup(func() {
+		gs.Stop()
+		_ = lis.Close()
+	})
+
+	c, err := Dial(lis.Addr().String(), certFile)
+	if err != nil {
+		t.Fatalf("Dial() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	value := 3.5
+	if err := c.SendMetrics(context.Background(), "10.0.0.1", []models.Metrics{
+		{ID: "g", MType: models.Gauge, Value: &value},
+	}); err != nil {
+		t.Fatalf("SendMetrics() error = %v", err)
+	}
+
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if len(srv.got) != 1 || srv.got[0].GetId() != "g" {
+		t.Errorf("server received %v, want one metric g", srv.got)
+	}
+}
+
+// TestDial_TLSNoCA проверяет fallback: сервер сгенерировал самоподписанный
+// сертификат, агент без CA подключается по TLS без проверки сервера.
+func TestDial_TLSNoCA(t *testing.T) {
+	creds, generated, err := grpctls.ServerCredentials("", "")
+	if err != nil {
+		t.Fatalf("ServerCredentials() error = %v", err)
+	}
+	if !generated {
+		t.Fatal("ServerCredentials(\"\") did not generate a certificate")
+	}
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+
+	srv := &captureServer{}
+	gs := grpc.NewServer(grpc.Creds(creds))
+	pb.RegisterMetricsServer(gs, srv)
+	go func() {
+		_ = gs.Serve(lis)
+	}()
+	t.Cleanup(func() {
+		gs.Stop()
+		_ = lis.Close()
+	})
+
+	c, err := Dial(lis.Addr().String(), "")
+	if err != nil {
+		t.Fatalf("Dial() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	value := 4.5
+	if err := c.SendMetrics(context.Background(), "10.0.0.1", []models.Metrics{
+		{ID: "g", MType: models.Gauge, Value: &value},
+	}); err != nil {
+		t.Fatalf("SendMetrics() error = %v", err)
+	}
+
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if len(srv.got) != 1 || srv.got[0].GetId() != "g" {
+		t.Errorf("server received %v, want one metric g", srv.got)
+	}
+}
+
+// writeTestCert создаёт самоподписанный сертификат для 127.0.0.1/localhost
+// и возвращает пути к PEM-файлам сертификата и ключа.
+func writeTestCert(t *testing.T) (certFile, keyFile string) {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey() error = %v", err)
+	}
+
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "grpc test"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		DNSNames:              []string{"localhost"},
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("CreateCertificate() error = %v", err)
+	}
+
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatalf("MarshalPKCS8PrivateKey() error = %v", err)
+	}
+
+	dir := t.TempDir()
+	certFile = filepath.Join(dir, "cert.pem")
+	keyFile = filepath.Join(dir, "key.pem")
+	if err := os.WriteFile(certFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
+		t.Fatalf("WriteFile(cert) error = %v", err)
+	}
+	if err := os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}), 0o600); err != nil {
+		t.Fatalf("WriteFile(key) error = %v", err)
+	}
+	return certFile, keyFile
+}
+
+// TestNew_CloseNoop проверяет, что клиент на чужом соединении не закрывает его.
+func TestNew_CloseNoop(t *testing.T) {
+	srv := &captureServer{}
+	conn := dialTestServer(t, srv)
+
+	c := New(conn)
+	if err := c.Close(); err != nil {
+		t.Errorf("Close() error = %v", err)
+	}
+
+	// Соединение, созданное не клиентом, осталось рабочим.
+	value := 1.0
+	if err := c.SendMetrics(context.Background(), "10.0.0.1", []models.Metrics{
+		{ID: "g", MType: models.Gauge, Value: &value},
+	}); err != nil {
+		t.Errorf("SendMetrics() after Close() error = %v", err)
+	}
+}
+
+// TestToProtoMetrics проверяет конвертацию модели в protobuf.
+func TestToProtoMetrics(t *testing.T) {
+	value := 2.5
+	delta := int64(7)
+
+	got := toProtoMetrics([]models.Metrics{
+		{ID: "g", MType: models.Gauge, Value: &value},
+		{ID: "c", MType: models.Counter, Delta: &delta},
+		{ID: "nil-gauge", MType: models.Gauge},
+		{ID: "unknown", MType: "histogram"},
+	})
+
+	if len(got) != 3 {
+		t.Fatalf("len = %d, want 3 (unknown type skipped)", len(got))
+	}
+	if got[0].GetValue() != value || got[0].GetType() != pb.Metric_GAUGE {
+		t.Errorf("gauge = %v", got[0])
+	}
+	if got[1].GetDelta() != delta || got[1].GetType() != pb.Metric_COUNTER {
+		t.Errorf("counter = %v", got[1])
+	}
+	if got[2].GetValue() != 0 {
+		t.Errorf("nil gauge value = %v, want 0", got[2].GetValue())
+	}
+}
+
+// TestIsRetriableGRPCError проверяет выбор повторяемых кодов.
+func TestIsRetriableGRPCError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "nil", err: nil, want: false},
+		{name: "unavailable", err: status.Error(codes.Unavailable, "down"), want: true},
+		{name: "deadline", err: status.Error(codes.DeadlineExceeded, "timeout"), want: true},
+		{name: "resource exhausted", err: status.Error(codes.ResourceExhausted, "limit"), want: true},
+		{name: "permission denied", err: status.Error(codes.PermissionDenied, "forbidden"), want: false},
+		{name: "plain error", err: errors.New("boom"), want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isRetriableGRPCError(tt.err); got != tt.want {
+				t.Errorf("isRetriableGRPCError(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
