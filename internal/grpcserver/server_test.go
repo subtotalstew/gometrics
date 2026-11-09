@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"sync/atomic"
 	"testing"
 
 	"google.golang.org/grpc"
@@ -176,6 +177,79 @@ func TestServer_UpdateMetrics_Errors(t *testing.T) {
 				t.Errorf("code = %v, want %v (err = %v)", status.Code(err), tt.code, err)
 			}
 		})
+	}
+}
+
+// TestNewGRPCServer_ChainsCallerInterceptor проверяет, что собственный
+// интерсептор вызывающей стороны не конфликтует с проверкой подсети:
+// grpc.UnaryInterceptor в opts не паникует, оба интерсептора выполняются,
+// а чужой IP по-прежнему получает PermissionDenied.
+func TestNewGRPCServer_ChainsCallerInterceptor(t *testing.T) {
+	mem := storage.NewMemStorage()
+
+	var called atomic.Bool
+	caller := func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		called.Store(true)
+		return handler(ctx, req)
+	}
+
+	// Обе формы пользовательского интерсептора не должны ронять конструктор.
+	if _, err := NewGRPCServer(mem, nil, "", grpc.UnaryInterceptor(caller)); err != nil {
+		t.Fatalf("NewGRPCServer(UnaryInterceptor) error = %v", err)
+	}
+	if _, err := NewGRPCServer(mem, nil, "", grpc.ChainUnaryInterceptor(caller)); err != nil {
+		t.Fatalf("NewGRPCServer(ChainUnaryInterceptor) error = %v", err)
+	}
+
+	gs, err := NewGRPCServer(mem, nil, "10.0.0.0/8", grpc.UnaryInterceptor(caller))
+	if err != nil {
+		t.Fatalf("NewGRPCServer() error = %v", err)
+	}
+
+	lis := bufconn.Listen(1024 * 1024)
+	go func() {
+		_ = gs.Serve(lis)
+	}()
+	t.Cleanup(func() {
+		gs.Stop()
+		_ = lis.Close()
+	})
+
+	conn, err := grpc.NewClient("passthrough:///bufnet",
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return lis.Dial() }),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("grpc.NewClient() error = %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	client := pb.NewMetricsClient(conn)
+
+	// Доверенный IP: оба интерсептора отработали, метрика сохранена.
+	ctx := metadata.AppendToOutgoingContext(context.Background(), MetadataRealIP, "10.1.2.3")
+	if _, err := client.UpdateMetrics(ctx, batch(gaugeMetric("g", 1))); err != nil {
+		t.Fatalf("UpdateMetrics() error = %v", err)
+	}
+	if !called.Load() {
+		t.Error("caller interceptor was not called for trusted IP")
+	}
+	if _, ok := mem.GetGauge("g"); !ok {
+		t.Error("metric was not saved for trusted IP")
+	}
+
+	// Чужой IP: интерсептор вызывающей стороны выполняется, но проверка
+	// подсети отклоняет запрос.
+	called.Store(false)
+	ctx = metadata.AppendToOutgoingContext(context.Background(), MetadataRealIP, "192.168.1.1")
+	if _, err := client.UpdateMetrics(ctx, batch(gaugeMetric("x", 2))); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("code = %v, want PermissionDenied (err = %v)", status.Code(err), err)
+	}
+	if !called.Load() {
+		t.Error("caller interceptor was not called for foreign IP")
+	}
+	if _, ok := mem.GetGauge("x"); ok {
+		t.Error("metric was saved for foreign IP")
 	}
 }
 

@@ -363,7 +363,7 @@ github.com/subtotalstew/gometrics.git/internal/config             79.5%
 github.com/subtotalstew/gometrics.git/internal/crypto             90.7%
 github.com/subtotalstew/gometrics.git/internal/grpcagent          97.4%
 github.com/subtotalstew/gometrics.git/internal/grpcserver         98.0%
-github.com/subtotalstew/gometrics.git/internal/grpctls            83.6%
+github.com/subtotalstew/gometrics.git/internal/grpctls            83.3%
 github.com/subtotalstew/gometrics.git/internal/handler            80.9%
 github.com/subtotalstew/gometrics.git/internal/hash              100.0%
 github.com/subtotalstew/gometrics.git/internal/loadgen            85.3%

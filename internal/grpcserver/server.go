@@ -141,16 +141,21 @@ func checkRealIP(ctx context.Context, trusted *net.IPNet) error {
 // она вызывает Serve и останавливает его при завершении работы.
 //
 // opts позволяют вызвающей стороне добавить настройки транспорта — в
-// частности, TLS-credentials (grpc.Creds). Сервер не включает шифрование сам:
-// сертификаты читает cmd/server на старте, чтобы ошибка в путях была видна
-// сразу.
+// частности, TLS-credentials (grpc.Creds) или собственные интерсепторы.
+// Сервер не включает шифрование сам: сертификаты читает cmd/server на старте,
+// чтобы ошибка в путях была видна сразу.
+//
+// Интерсептор подсети добавляется через grpc.ChainUnaryInterceptor, а не
+// grpc.UnaryInterceptor: второй UnaryInterceptor в opts привёл бы к панике
+// grpc.NewServer, а цепочка спокойно композируется с интерсепторами
+// вызывающей стороны (они выполняются раньше проверки подсети).
 func NewGRPCServer(st storage.Storage, syncSave func(), trustedSubnet string, opts ...grpc.ServerOption) (*grpc.Server, error) {
 	interceptor, err := TrustedSubnetInterceptor(trustedSubnet)
 	if err != nil {
 		return nil, err
 	}
 
-	opts = append(opts, grpc.UnaryInterceptor(interceptor))
+	opts = append(opts, grpc.ChainUnaryInterceptor(interceptor))
 	gs := grpc.NewServer(opts...)
 	pb.RegisterMetricsServer(gs, New(st, syncSave))
 	return gs, nil
